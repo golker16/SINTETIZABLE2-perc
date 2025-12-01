@@ -1,6 +1,9 @@
 import sys
 import os
 import glob
+import re
+from datetime import datetime
+
 import numpy as np
 import soundfile as sf
 
@@ -47,6 +50,21 @@ WT_MIP_LEVELS = 8
 WT_DIR_DEFAULT = r"D:\WAVETABLE"
 
 AUDIO_EXTS = (".wav", ".flac", ".ogg", ".mp3", ".aiff", ".aif", ".m4a")
+
+# Band labels used in filename (must match env_bands order: 0..3)
+BAND_NAMES = ["LOW", "LOWMID", "HIGHMID", "HIGH"]
+
+
+def _date_ddmmyyyy_dash() -> str:
+    d = datetime.now()
+    return f"{d.day}-{d.month}-{d.year}"  # 1-12-2025
+
+
+def _safe_name(path: str, maxlen: int = 60) -> str:
+    s = os.path.splitext(os.path.basename(path))[0]
+    s = s.strip().replace(" ", "_")
+    s = re.sub(r"[^A-Za-z0-9_\-]+", "", s)
+    return (s or "WT")[:maxlen]
 
 
 # ----------------- WAVETABLE OSC -----------------
@@ -477,8 +495,9 @@ class AudioWorker(QObject):
         self._mipmap_cache[wt_path] = mipmaps
         return mipmaps
 
-    def _process_one(self, src_file: str, out_file: str, wavetable_files: list, rng: np.random.Generator):
-        self.log.emit(f"Fuente: {os.path.basename(src_file)}")
+    # NEW: generates 4 outputs per input, same CAPA number
+    def _process_one(self, src_file: str, out_dir: str, wavetable_files: list, rng: np.random.Generator, capa_num: int):
+        self.log.emit(f"Fuente: {os.path.basename(src_file)} | CAPA{capa_num}")
         y, sr = load_mono(src_file)
         self.log.emit(f"  len={len(y)} sr={sr}")
 
@@ -494,57 +513,63 @@ class AudioWorker(QObject):
             spec_smooth_bins=self.spec_smooth_bins,
         )
 
-        picks = rng.choice(wavetable_files, size=4, replace=(len(wavetable_files) < 4))
-        layers = []
+        os.makedirs(out_dir, exist_ok=True)
+        date_tag = _date_ddmmyyyy_dash()
 
-        for i in range(4):
-            wt = str(picks[i])
-            mipmaps = self._load_mipmaps_cached(wt)
+        # 4 resultados por audio (misma CAPA; cambian los wavetables al azar)
+        for take_idx in range(4):
+            picks = rng.choice(wavetable_files, size=4, replace=(len(wavetable_files) < 4))
+            picks = [str(p) for p in picks]
+            wt_names = [_safe_name(p) for p in picks]
 
-            pos = float(rng.uniform(self.pos_min, self.pos_max))
-            mip = float(rng.uniform(self.mip_min, self.mip_max))
+            layers = []
+            for i in range(4):
+                wt = picks[i]
+                mipmaps = self._load_mipmaps_cached(wt)
 
-            layer = synth_wavetable_from_f0_env(
-                f0_frames_hz=f0_frames,
-                env_frames=env_bands[i],
-                sr=sr,
-                n_samples=len(y),
-                frame_length=self.frame_length,
-                hop_length=self.hop_length,
-                mipmaps=mipmaps,
-                position=pos,
-                mip_strength=mip,
-            )
-            layers.append(layer)
-            self.log.emit(f"  Layer {i+1}: {os.path.basename(wt)} | pos={pos:.2f} mip={mip:.2f}")
+                pos = float(rng.uniform(self.pos_min, self.pos_max))
+                mip = float(rng.uniform(self.mip_min, self.mip_max))
 
-        mix = np.sum(np.stack(layers, axis=0), axis=0).astype(np.float32)
-        mx = float(np.max(np.abs(mix)) + 1e-12)
-        mix = (mix / mx * 0.95).astype(np.float32)
+                layer = synth_wavetable_from_f0_env(
+                    f0_frames_hz=f0_frames,
+                    env_frames=env_bands[i],
+                    sr=sr,
+                    n_samples=len(y),
+                    frame_length=self.frame_length,
+                    hop_length=self.hop_length,
+                    mipmaps=mipmaps,
+                    position=pos,
+                    mip_strength=mip,
+                )
+                layers.append(layer)
 
-        if self.enable_spec_match:
-            self.log.emit("  Aplicando spectral envelope match (timbre)...")
-            mix = spectral_envelope_match(
-                y_syn=mix,
-                sr=sr,
-                spec_env_src=spec_env,
-                frame_length=self.frame_length,
-                hop_length=self.hop_length,
-                spec_smooth_bins=self.spec_smooth_bins,
-                strength=self.spec_strength,
-                clamp_lo=self.spec_clamp_lo,
-                clamp_hi=self.spec_clamp_hi,
-            )
+            mix = np.sum(np.stack(layers, axis=0), axis=0).astype(np.float32)
+            mx = float(np.max(np.abs(mix)) + 1e-12)
+            mix = (mix / mx * 0.95).astype(np.float32)
 
-        if self.output_gain != 1.0:
-            mix = np.clip(mix * float(self.output_gain), -1.0, 1.0).astype(np.float32)
+            if self.enable_spec_match:
+                mix = spectral_envelope_match(
+                    y_syn=mix,
+                    sr=sr,
+                    spec_env_src=spec_env,
+                    frame_length=self.frame_length,
+                    hop_length=self.hop_length,
+                    spec_smooth_bins=self.spec_smooth_bins,
+                    strength=self.spec_strength,
+                    clamp_lo=self.spec_clamp_lo,
+                    clamp_hi=self.spec_clamp_hi,
+                )
 
-        out_dir = os.path.dirname(out_file)
-        if out_dir and not os.path.isdir(out_dir):
-            os.makedirs(out_dir, exist_ok=True)
+            if self.output_gain != 1.0:
+                mix = np.clip(mix * float(self.output_gain), -1.0, 1.0).astype(np.float32)
 
-        sf.write(out_file, mix, sr)
-        self.log.emit(f"  Guardado: {out_file}")
+            # Nombre: CAPA + (1BANDA_wavetable...) + fecha
+            parts = [f"{i+1}{BAND_NAMES[i]}_{wt_names[i]}" for i in range(4)]
+            fname = f"CAPA{capa_num}_" + "_".join(parts) + f"__{date_tag}.wav"
+            out_file = os.path.join(out_dir, fname)
+
+            sf.write(out_file, mix, sr)
+            self.log.emit(f"  Guardado: {out_file}")
 
     def run(self):
         try:
@@ -565,23 +590,20 @@ class AudioWorker(QObject):
                 if not os.path.isfile(inp):
                     raise RuntimeError("Input single debe ser un archivo.")
 
-                # Si output es carpeta, guardamos ahí con nombre automático
+                # SINGLE: decidir carpeta de salida
                 if os.path.isdir(outp):
-                    base = os.path.splitext(os.path.basename(inp))[0]
-                    out_file = os.path.join(outp, base + "__restored.wav")
+                    out_dir = outp
                 else:
-                    # si no tiene extensión, asumimos carpeta y la creamos
-                    if os.path.splitext(outp)[1].lower() != ".wav":
-                        os.makedirs(outp, exist_ok=True)
-                        base = os.path.splitext(os.path.basename(inp))[0]
-                        out_file = os.path.join(outp, base + "__restored.wav")
-                    else:
-                        out_file = outp
+                    ext = os.path.splitext(outp)[1].lower()
+                    out_dir = os.path.dirname(outp) if ext == ".wav" else outp
+                    os.makedirs(out_dir, exist_ok=True)
 
                 self.progress.emit(5)
-                self.log.emit("=== PROCESO SINGLE ===")
-                self.log.emit(f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}")
-                self._process_one(inp, out_file, wavetable_files, rng)
+                self.log.emit("=== PROCESO SINGLE (4 outputs = CAPA1) ===")
+                self.log.emit(
+                    f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
+                )
+                self._process_one(inp, out_dir, wavetable_files, rng, capa_num=1)
                 self.progress.emit(100)
                 self.finished.emit()
                 return
@@ -600,23 +622,22 @@ class AudioWorker(QObject):
             if not files:
                 raise RuntimeError("No se encontraron audios en la carpeta input.")
 
-            self.log.emit("=== PROCESO BATCH ===")
+            self.log.emit("=== PROCESO BATCH (4 outputs por audio) ===")
             self.log.emit(f"Input: {in_dir}")
             self.log.emit(f"Output: {out_dir}")
-            self.log.emit(f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}")
+            self.log.emit(
+                f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
+            )
             self.progress.emit(1)
 
             total = len(files)
             for idx, src_file in enumerate(files):
-                base = os.path.splitext(os.path.basename(src_file))[0]
-                out_file = os.path.join(out_dir, base + "__restored.wav")
-
-                self.log.emit(f"\n[{idx+1}/{total}]")
+                self.log.emit(f"\n[{idx+1}/{total}] => CAPA{idx+1}")
                 p = int(5 + 90 * (idx / max(1, total)))
                 self.progress.emit(p)
 
                 # ✅ RNG continuo: completamente random a lo largo del batch
-                self._process_one(src_file, out_file, wavetable_files, rng)
+                self._process_one(src_file, out_dir, wavetable_files, rng, capa_num=idx + 1)
 
             self.progress.emit(100)
             self.finished.emit()
