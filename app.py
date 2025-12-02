@@ -9,7 +9,6 @@ import soundfile as sf
 
 # librosa imports mínimos (sin sklearn)
 from librosa.core.audio import load as lr_load
-from librosa.core.audio import resample as lr_resample  # NEW
 from librosa.core.pitch import pyin as lr_pyin
 from librosa.core.convert import note_to_hz as lr_note_to_hz
 from librosa.core.spectrum import stft as lr_stft, istft as lr_istft
@@ -54,12 +53,6 @@ AUDIO_EXTS = (".wav", ".flac", ".ogg", ".mp3", ".aiff", ".aif", ".m4a")
 
 # Band labels used in filename (must match env_bands order: 0..3)
 BAND_NAMES = ["LOW", "LOWMID", "HIGHMID", "HIGH"]
-
-# NEW: resample everything to 96k for analysis + synthesis
-TARGET_SR = 96000
-
-# NEW: export 24-bit PCM WAV
-OUTPUT_SUBTYPE = "PCM_24"
 
 
 def _date_ddmmyyyy_dash() -> str:
@@ -202,21 +195,10 @@ def render_wavetable_osc(
         ph += float(f0_hz[i]) / float(sr)
         ph -= np.floor(ph)
 
-    # NEW: mip selector (depende de sr y f0): samples-per-period -> target table length
-    base_len = mipmaps[0].shape[1]
-
-    # spp = samples per period
-    spp = np.maximum(float(sr) / np.maximum(f0_hz, 1e-6), 1.0).astype(np.float32)
-
-    # target table length ~ spp * K (K controla agresividad, 4..12 típico)
-    K = 8.0
-    target_len = np.clip(spp * K, 32.0, float(base_len))
-
-    lvl_float = np.log2(float(base_len) / target_len)
-
-    # intensidad del mip (0..1): 0 = no mip, 1 = full
-    lvl_float = lvl_float * float(np.clip(mip_strength, 0.0, 1.0))
-
+    # mip selector simple
+    f_ref = 55.0
+    ratio = np.maximum(f0_hz / f_ref, 1e-6)
+    lvl_float = np.log2(ratio) * float(np.clip(mip_strength, 0.0, 1.0))
     lvl = np.clip(np.floor(lvl_float).astype(np.int32), 0, n_levels - 1)
 
     out = np.zeros(n_samples, dtype=np.float32)
@@ -272,16 +254,8 @@ def synth_wavetable_from_f0_env(
 # ----------------- ANALYSIS -----------------
 
 def load_mono(path: str):
-    # NEW: always return TARGET_SR
     y, sr = lr_load(path, sr=None, mono=True)
-    y = y.astype(np.float32, copy=False)
-    sr = int(sr)
-
-    if sr != TARGET_SR:
-        y = lr_resample(y, orig_sr=sr, target_sr=TARGET_SR).astype(np.float32, copy=False)
-        sr = TARGET_SR
-
-    return y, sr
+    return y.astype(np.float32, copy=False), int(sr)
 
 
 def one_pole_smooth(x: np.ndarray, alpha: float) -> np.ndarray:
@@ -608,8 +582,7 @@ class AudioWorker(QObject):
             fname = f"CAPA{capa_num}_" + "_".join(parts) + f"__{date_tag}.wav"
             out_file = os.path.join(out_dir, fname)
 
-            # NEW: 24-bit PCM export (still at 96k because sr==TARGET_SR)
-            sf.write(out_file, mix, sr, subtype=OUTPUT_SUBTYPE)
+            sf.write(out_file, mix, sr)
             self.log.emit(f"  Guardado: {out_file}")
 
     def run(self):
@@ -642,7 +615,7 @@ class AudioWorker(QObject):
                 self.progress.emit(5)
                 self.log.emit("=== PROCESO SINGLE (4 outputs = CAPA1) ===")
                 self.log.emit(
-                    f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed} | SR={TARGET_SR} | OUT={OUTPUT_SUBTYPE}"
+                    f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
                 )
                 self._process_one(inp, out_dir, wavetable_files, rng, capa_num=1)
                 self.progress.emit(100)
@@ -667,7 +640,7 @@ class AudioWorker(QObject):
             self.log.emit(f"Input: {in_dir}")
             self.log.emit(f"Output: {out_dir}")
             self.log.emit(
-                f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed} | SR={TARGET_SR} | OUT={OUTPUT_SUBTYPE}"
+                f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
             )
             self.progress.emit(1)
 
@@ -1015,4 +988,5 @@ if __name__ == "__main__":
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
+
 
