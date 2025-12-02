@@ -1,9 +1,6 @@
 import sys
 import os
 import glob
-import re
-from datetime import datetime
-
 import numpy as np
 import soundfile as sf
 
@@ -35,40 +32,19 @@ from PySide6.QtWidgets import (
     QGroupBox,
 )
 
-
 # ----------------- DEFAULTS -----------------
-
 FMIN_NOTE = "C2"
 FMAX_NOTE = "C7"
-
 DEFAULT_FRAME_LENGTH = 2048
 DEFAULT_HOP_LENGTH = 256
 
 WT_FRAME_SIZE = 2048
 WT_MIP_LEVELS = 8
-
 WT_DIR_DEFAULT = r"D:\WAVETABLE"
-
 AUDIO_EXTS = (".wav", ".flac", ".ogg", ".mp3", ".aiff", ".aif", ".m4a")
-
-# Band labels used in filename (must match env_bands order: 0..3)
-BAND_NAMES = ["LOW", "LOWMID", "HIGHMID", "HIGH"]
-
-
-def _date_ddmmyyyy_dash() -> str:
-    d = datetime.now()
-    return f"{d.day}-{d.month}-{d.year}"  # 1-12-2025
-
-
-def _safe_name(path: str, maxlen: int = 60) -> str:
-    s = os.path.splitext(os.path.basename(path))[0]
-    s = s.strip().replace(" ", "_")
-    s = re.sub(r"[^A-Za-z0-9_\-]+", "", s)
-    return (s or "WT")[:maxlen]
 
 
 # ----------------- WAVETABLE OSC -----------------
-
 def _to_mono_float(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x)
     if x.ndim == 2:
@@ -108,16 +84,12 @@ def load_wavetable_wav(
 ) -> np.ndarray:
     audio, _sr = sf.read(path, always_2d=False)
     audio = _to_mono_float(audio)
-
     if len(audio) < frame_size:
         audio = np.pad(audio, (0, frame_size - len(audio)))
-
     n_frames = max(1, len(audio) // frame_size)
     use_len = n_frames * frame_size
     audio = audio[:use_len]
-
     frames = audio.reshape(n_frames, frame_size).copy()
-
     for i in range(n_frames):
         f = frames[i]
         f = f - np.mean(f)
@@ -125,32 +97,25 @@ def load_wavetable_wav(
         if normalize_each_frame:
             f = _normalize_frame(f)
         frames[i] = f
-
     return frames.astype(np.float32, copy=False)
 
 
 def build_wavetable_mipmaps(frames: np.ndarray, levels: int = WT_MIP_LEVELS):
     frames = np.asarray(frames, dtype=np.float32)
     n_frames, frame_size = frames.shape
-
     mipmaps = []
     cur = frames
     cur_size = frame_size
-
     for _lvl in range(levels):
         mipmaps.append(cur)
-
         next_size = max(32, cur_size // 2)
         if next_size == cur_size:
             break
-
         nxt = np.zeros((n_frames, next_size), dtype=np.float32)
         for fi in range(n_frames):
             nxt[fi] = _linear_resample(cur[fi], next_size)
-
         cur = nxt
         cur_size = next_size
-
     return mipmaps
 
 
@@ -178,7 +143,6 @@ def render_wavetable_osc(
     f0_hz = np.asarray(f0_hz, dtype=np.float32)
     n_samples = len(f0_hz)
     n_levels = len(mipmaps)
-
     base_frames = mipmaps[0]
     n_frames = base_frames.shape[0]
 
@@ -237,7 +201,6 @@ def synth_wavetable_from_f0_env(
     env = np.interp(t, centers.astype(np.float32), env_frames).astype(np.float32)
 
     f0 = np.clip(f0, 1.0, sr / 2.0)
-
     osc, _ = render_wavetable_osc(
         f0_hz=f0,
         sr=sr,
@@ -252,7 +215,6 @@ def synth_wavetable_from_f0_env(
 
 
 # ----------------- ANALYSIS -----------------
-
 def load_mono(path: str):
     y, sr = lr_load(path, sr=None, mono=True)
     return y.astype(np.float32, copy=False), int(sr)
@@ -271,12 +233,10 @@ def smooth_freq_logmag(logmag: np.ndarray, smooth_bins: int) -> np.ndarray:
     smooth_bins = int(max(1, smooth_bins))
     if smooth_bins <= 1:
         return logmag
-
     k = smooth_bins
     kernel = np.ones(k, dtype=np.float32) / float(k)
     pad = k // 2
     padded = np.pad(logmag, ((pad, pad), (0, 0)), mode="reflect")
-
     out = np.empty_like(logmag, dtype=np.float32)
     for t in range(logmag.shape[1]):
         out[:, t] = np.convolve(padded[:, t], kernel, mode="valid").astype(np.float32)
@@ -315,24 +275,28 @@ def extract_f0_multiband_env_and_specenv(
             f0_clean[i] = last
         else:
             last = f0_clean[i]
-
     f0_clean = one_pole_smooth(f0_clean, alpha=f0_smooth_alpha)
 
     # ---- STFT magnitude ----
     n_fft = frame_length
-    S = lr_stft(y.astype(np.float32), n_fft=n_fft, hop_length=hop_length, win_length=frame_length, center=True)
+    S = lr_stft(
+        y.astype(np.float32),
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=frame_length,
+        center=True,
+    )
     mag = np.abs(S).astype(np.float32)
     n_bins, n_frames = mag.shape
 
     # ---- multiband env (4 bandas) ----
     freqs = np.linspace(0.0, sr / 2.0, n_bins, dtype=np.float32)
     edges = [
-        (20.0, 140.0),     # low
-        (140.0, 700.0),    # lowmid
-        (700.0, 4000.0),   # highmid
+        (20.0, 140.0),  # low
+        (140.0, 700.0),  # lowmid
+        (700.0, 4000.0),  # highmid
         (4000.0, min(16000.0, sr / 2.0 - 1.0)),  # high
     ]
-
     env_bands = np.zeros((4, n_frames), dtype=np.float32)
     for bi, (lo, hi) in enumerate(edges):
         mask = (freqs >= lo) & (freqs < hi)
@@ -368,7 +332,7 @@ def extract_f0_multiband_env_and_specenv(
 def spectral_envelope_match(
     y_syn: np.ndarray,
     sr: int,
-    spec_env_src: np.ndarray,   # (bins, frames)
+    spec_env_src: np.ndarray,  # (bins, frames)
     frame_length: int,
     hop_length: int,
     spec_smooth_bins: int,
@@ -381,7 +345,13 @@ def spectral_envelope_match(
         return y_syn
 
     n_fft = frame_length
-    S = lr_stft(y_syn.astype(np.float32), n_fft=n_fft, hop_length=hop_length, win_length=frame_length, center=True)
+    S = lr_stft(
+        y_syn.astype(np.float32),
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=frame_length,
+        center=True,
+    )
     mag = np.abs(S).astype(np.float32)
     phase = np.angle(S).astype(np.float32)
 
@@ -401,27 +371,20 @@ def spectral_envelope_match(
     G = np.clip(G, float(clamp_lo), float(clamp_hi)).astype(np.float32)
 
     mag_out = mag_use * np.power(G, strength).astype(np.float32)
-
     S_out = mag_out * (np.cos(ph_use) + 1j * np.sin(ph_use))
-    y_out = lr_istft(S_out, hop_length=hop_length, win_length=frame_length, center=True, length=len(y_syn))
+
+    y_out = lr_istft(
+        S_out,
+        hop_length=hop_length,
+        win_length=frame_length,
+        center=True,
+        length=len(y_syn),
+    )
     y_out = np.asarray(y_out, dtype=np.float32)
     return np.clip(y_out, -1.0, 1.0).astype(np.float32, copy=False)
 
 
 # ----------------- FILE LISTING -----------------
-
-def _dedupe_paths(paths):
-    seen = set()
-    out = []
-    for p in paths:
-        key = os.path.normcase(os.path.abspath(p))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(p)
-    return out
-
-
 def list_wav_files(folder: str, recursive: bool = True):
     if not folder or not os.path.isdir(folder):
         return []
@@ -429,7 +392,6 @@ def list_wav_files(folder: str, recursive: bool = True):
     files = glob.glob(os.path.join(folder, pattern), recursive=recursive)
     files += glob.glob(os.path.join(folder, pattern.upper()), recursive=recursive)
     files = [f for f in files if os.path.isfile(f)]
-    files = _dedupe_paths(files)
     files.sort(key=lambda p: p.lower())
     return files
 
@@ -440,13 +402,11 @@ def list_audio_files(folder: str):
         files += glob.glob(os.path.join(folder, f"*{ext}"))
         files += glob.glob(os.path.join(folder, f"*{ext.upper()}"))
     files = [f for f in files if os.path.isfile(f)]
-    files = _dedupe_paths(files)
     files.sort(key=lambda p: p.lower())
     return files
 
 
 # ----------------- WORKER -----------------
-
 class AudioWorker(QObject):
     progress = Signal(int)
     log = Signal(str)
@@ -458,7 +418,7 @@ class AudioWorker(QObject):
         input_path: str,
         output_path: str,
         wt_dir: str,
-        seed: int,               # 0 => azar total
+        seed: int,  # 0 => azar total
         pos_min: float,
         pos_max: float,
         mip_min: float,
@@ -490,13 +450,11 @@ class AudioWorker(QObject):
         self.f0_alpha = float(f0_alpha)
         self.gate_unvoiced = bool(gate_unvoiced)
         self.output_gain = float(output_gain)
-
         self.enable_spec_match = bool(enable_spec_match)
         self.spec_strength = float(spec_strength)
         self.spec_smooth_bins = int(spec_smooth_bins)
         self.spec_clamp_lo = float(spec_clamp_lo)
         self.spec_clamp_hi = float(spec_clamp_hi)
-
         self._mipmap_cache = {}
 
     def _load_mipmaps_cached(self, wt_path: str):
@@ -509,13 +467,12 @@ class AudioWorker(QObject):
         self._mipmap_cache[wt_path] = mipmaps
         return mipmaps
 
-    # Generates 4 outputs per input, same CAPA number
-    def _process_one(self, src_file: str, out_dir: str, wavetable_files: list, rng: np.random.Generator, capa_num: int):
-        self.log.emit(f"Fuente: {os.path.basename(src_file)} | CAPA{capa_num}")
+    def _process_one(self, src_file: str, out_file: str, wavetable_files: list, rng: np.random.Generator):
+        self.log.emit(f"Fuente: {os.path.basename(src_file)}")
         y, sr = load_mono(src_file)
-        self.log.emit(f"  len={len(y)} sr={sr}")
+        self.log.emit(f" len={len(y)} sr={sr}")
+        self.log.emit(" Analizando: F0 + multiband env + spectral envelope...")
 
-        self.log.emit("  Analizando: F0 + multiband env + spectral envelope...")
         f0_frames, voiced, env_bands, spec_env = extract_f0_multiband_env_and_specenv(
             y=y,
             sr=sr,
@@ -527,63 +484,54 @@ class AudioWorker(QObject):
             spec_smooth_bins=self.spec_smooth_bins,
         )
 
-        os.makedirs(out_dir, exist_ok=True)
-        date_tag = _date_ddmmyyyy_dash()
+        picks = rng.choice(wavetable_files, size=4, replace=(len(wavetable_files) < 4))
+        layers = []
+        for i in range(4):
+            wt = str(picks[i])
+            mipmaps = self._load_mipmaps_cached(wt)
+            pos = float(rng.uniform(self.pos_min, self.pos_max))
+            mip = float(rng.uniform(self.mip_min, self.mip_max))
 
-        # 4 resultados por audio (misma CAPA; cambian los wavetables al azar)
-        for take_idx in range(4):
-            picks = rng.choice(wavetable_files, size=4, replace=(len(wavetable_files) < 4))
-            picks = [str(p) for p in picks]
-            wt_names = [_safe_name(p) for p in picks]
+            layer = synth_wavetable_from_f0_env(
+                f0_frames_hz=f0_frames,
+                env_frames=env_bands[i],
+                sr=sr,
+                n_samples=len(y),
+                frame_length=self.frame_length,
+                hop_length=self.hop_length,
+                mipmaps=mipmaps,
+                position=pos,
+                mip_strength=mip,
+            )
+            layers.append(layer)
+            self.log.emit(f" Layer {i+1}: {os.path.basename(wt)} | pos={pos:.2f} mip={mip:.2f}")
 
-            layers = []
-            for i in range(4):
-                wt = picks[i]
-                mipmaps = self._load_mipmaps_cached(wt)
+        mix = np.sum(np.stack(layers, axis=0), axis=0).astype(np.float32)
+        mx = float(np.max(np.abs(mix)) + 1e-12)
+        mix = (mix / mx * 0.95).astype(np.float32)
 
-                pos = float(rng.uniform(self.pos_min, self.pos_max))
-                mip = float(rng.uniform(self.mip_min, self.mip_max))
+        if self.enable_spec_match:
+            self.log.emit(" Aplicando spectral envelope match (timbre)...")
+            mix = spectral_envelope_match(
+                y_syn=mix,
+                sr=sr,
+                spec_env_src=spec_env,
+                frame_length=self.frame_length,
+                hop_length=self.hop_length,
+                spec_smooth_bins=self.spec_smooth_bins,
+                strength=self.spec_strength,
+                clamp_lo=self.spec_clamp_lo,
+                clamp_hi=self.spec_clamp_hi,
+            )
 
-                layer = synth_wavetable_from_f0_env(
-                    f0_frames_hz=f0_frames,
-                    env_frames=env_bands[i],
-                    sr=sr,
-                    n_samples=len(y),
-                    frame_length=self.frame_length,
-                    hop_length=self.hop_length,
-                    mipmaps=mipmaps,
-                    position=pos,
-                    mip_strength=mip,
-                )
-                layers.append(layer)
+        if self.output_gain != 1.0:
+            mix = np.clip(mix * float(self.output_gain), -1.0, 1.0).astype(np.float32)
 
-            mix = np.sum(np.stack(layers, axis=0), axis=0).astype(np.float32)
-            mx = float(np.max(np.abs(mix)) + 1e-12)
-            mix = (mix / mx * 0.95).astype(np.float32)
-
-            if self.enable_spec_match:
-                mix = spectral_envelope_match(
-                    y_syn=mix,
-                    sr=sr,
-                    spec_env_src=spec_env,
-                    frame_length=self.frame_length,
-                    hop_length=self.hop_length,
-                    spec_smooth_bins=self.spec_smooth_bins,
-                    strength=self.spec_strength,
-                    clamp_lo=self.spec_clamp_lo,
-                    clamp_hi=self.spec_clamp_hi,
-                )
-
-            if self.output_gain != 1.0:
-                mix = np.clip(mix * float(self.output_gain), -1.0, 1.0).astype(np.float32)
-
-            # Nombre: CAPA + (1BANDA_wavetable...) + fecha
-            parts = [f"{i+1}{BAND_NAMES[i]}_{wt_names[i]}" for i in range(4)]
-            fname = f"CAPA{capa_num}_" + "_".join(parts) + f"__{date_tag}.wav"
-            out_file = os.path.join(out_dir, fname)
-
-            sf.write(out_file, mix, sr)
-            self.log.emit(f"  Guardado: {out_file}")
+        out_dir = os.path.dirname(out_file)
+        if out_dir and not os.path.isdir(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        sf.write(out_file, mix, sr)
+        self.log.emit(f" Guardado: {out_file}")
 
     def run(self):
         try:
@@ -598,26 +546,30 @@ class AudioWorker(QObject):
             rng = np.random.default_rng(None if self.seed == 0 else self.seed)
 
             is_batch = os.path.isdir(inp)
-
             if not is_batch:
                 # SINGLE
                 if not os.path.isfile(inp):
                     raise RuntimeError("Input single debe ser un archivo.")
 
-                # SINGLE: decidir carpeta de salida
+                # Si output es carpeta, guardamos ahí con nombre automático
                 if os.path.isdir(outp):
-                    out_dir = outp
+                    base = os.path.splitext(os.path.basename(inp))[0]
+                    out_file = os.path.join(outp, base + "__restored.wav")
                 else:
-                    ext = os.path.splitext(outp)[1].lower()
-                    out_dir = os.path.dirname(outp) if ext == ".wav" else outp
-                    os.makedirs(out_dir, exist_ok=True)
+                    # si no tiene extensión, asumimos carpeta y la creamos
+                    if os.path.splitext(outp)[1].lower() != ".wav":
+                        os.makedirs(outp, exist_ok=True)
+                        base = os.path.splitext(os.path.basename(inp))[0]
+                        out_file = os.path.join(outp, base + "__restored.wav")
+                    else:
+                        out_file = outp
 
                 self.progress.emit(5)
-                self.log.emit("=== PROCESO SINGLE (4 outputs = CAPA1) ===")
+                self.log.emit("=== PROCESO SINGLE ===")
                 self.log.emit(
                     f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
                 )
-                self._process_one(inp, out_dir, wavetable_files, rng, capa_num=1)
+                self._process_one(inp, out_file, wavetable_files, rng)
                 self.progress.emit(100)
                 self.finished.emit()
                 return
@@ -627,7 +579,6 @@ class AudioWorker(QObject):
             out_dir = outp
             if os.path.isfile(out_dir):
                 out_dir = os.path.dirname(out_dir)
-
             if not out_dir:
                 raise RuntimeError("Output batch debe ser una carpeta válida.")
             os.makedirs(out_dir, exist_ok=True)
@@ -636,22 +587,24 @@ class AudioWorker(QObject):
             if not files:
                 raise RuntimeError("No se encontraron audios en la carpeta input.")
 
-            self.log.emit("=== PROCESO BATCH (4 outputs por audio) ===")
+            self.log.emit("=== PROCESO BATCH ===")
             self.log.emit(f"Input: {in_dir}")
             self.log.emit(f"Output: {out_dir}")
             self.log.emit(
                 f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
             )
-            self.progress.emit(1)
 
+            self.progress.emit(1)
             total = len(files)
             for idx, src_file in enumerate(files):
-                self.log.emit(f"\n[{idx+1}/{total}] => CAPA{idx+1}")
+                base = os.path.splitext(os.path.basename(src_file))[0]
+                out_file = os.path.join(out_dir, base + "__restored.wav")
+                self.log.emit(f"\n[{idx+1}/{total}]")
                 p = int(5 + 90 * (idx / max(1, total)))
                 self.progress.emit(p)
 
                 # ✅ RNG continuo: completamente random a lo largo del batch
-                self._process_one(src_file, out_dir, wavetable_files, rng, capa_num=idx + 1)
+                self._process_one(src_file, out_file, wavetable_files, rng)
 
             self.progress.emit(100)
             self.finished.emit()
@@ -661,7 +614,6 @@ class AudioWorker(QObject):
 
 
 # ----------------- UI -----------------
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -670,7 +622,6 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-
         layout = QVBoxLayout(central)
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(10)
@@ -722,6 +673,7 @@ class MainWindow(QMainWindow):
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 2_000_000_000)
         self.seed_spin.setValue(0)
+
         row_rand.addWidget(QLabel("Seed (0 = RANDOM SIEMPRE):"))
         row_rand.addWidget(self.seed_spin)
 
@@ -759,7 +711,6 @@ class MainWindow(QMainWindow):
 
         row_rand.addStretch()
         g.addLayout(row_rand)
-
         layout.addWidget(gb_wt)
 
         # Analysis
@@ -863,6 +814,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.logs, stretch=1)
 
         layout.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Expanding))
+
         footer = QLabel("© 2025 Gabriel Golker")
         footer.setAlignment(Qt.AlignCenter)
         layout.addWidget(footer)
@@ -876,7 +828,10 @@ class MainWindow(QMainWindow):
     # --------- pickers ---------
     def pick_input_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Seleccionar audio fuente", "", "Audio files (*.wav *.flac *.ogg *.mp3 *.aiff *.m4a);;Todos (*.*)"
+            self,
+            "Seleccionar audio fuente",
+            "",
+            "Audio files (*.wav *.flac *.ogg *.mp3 *.aiff *.m4a);;Todos (*.*)",
         )
         if path:
             self.in_edit.setText(path)
@@ -888,7 +843,10 @@ class MainWindow(QMainWindow):
 
     def pick_output_file(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Guardar salida", "resultado__restored.wav", "WAV (*.wav);;Todos (*.*)"
+            self,
+            "Guardar salida",
+            "resultado__restored.wav",
+            "WAV (*.wav);;Todos (*.*)",
         )
         if path:
             self.out_edit.setText(path)
@@ -953,9 +911,10 @@ class MainWindow(QMainWindow):
             spec_clamp_lo=float(self.spec_clamp_lo.value()),
             spec_clamp_hi=float(self.spec_clamp_hi.value()),
         )
-        self.worker.moveToThread(self.thread)
 
+        self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
+
         self.worker.progress.connect(self.progress.setValue)
         self.worker.log.connect(self.log)
         self.worker.finished.connect(self.on_done)
@@ -983,10 +942,8 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     import qdarkstyle
-    app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6"))
 
+    app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6"))
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
-
-
