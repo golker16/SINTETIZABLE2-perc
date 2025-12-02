@@ -6,9 +6,6 @@ import soundfile as sf
 
 # librosa imports mínimos (sin sklearn)
 from librosa.core.audio import load as lr_load
-# NOTE: pitch imports ya no se usan en modo percusivo, pero puedes dejarlos si quieres
-# from librosa.core.pitch import pyin as lr_pyin
-# from librosa.core.convert import note_to_hz as lr_note_to_hz
 from librosa.core.spectrum import stft as lr_stft, istft as lr_istft
 
 from PySide6.QtCore import QObject, QThread, Signal, Qt
@@ -43,8 +40,7 @@ WT_DIR_DEFAULT = r"D:\WAVETABLE"
 AUDIO_EXTS = (".wav", ".flac", ".ogg", ".mp3", ".aiff", ".aif", ".m4a")
 
 
-# ----------------- WAVETABLE OSC -----------------
-# (Se conserva por si luego vuelves a usar wavetables; en modo percusivo no se usa.)
+# ----------------- WAVETABLE IO -----------------
 def _to_mono_float(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x)
     if x.ndim == 2:
@@ -119,7 +115,7 @@ def build_wavetable_mipmaps(frames: np.ndarray, levels: int = WT_MIP_LEVELS):
     return mipmaps
 
 
-# ----------------- ANALYSIS -----------------
+# ----------------- AUDIO UTILS -----------------
 def load_mono(path: str):
     y, sr = lr_load(path, sr=None, mono=True)
     return y.astype(np.float32, copy=False), int(sr)
@@ -148,7 +144,7 @@ def smooth_freq_logmag(logmag: np.ndarray, smooth_bins: int) -> np.ndarray:
     return out
 
 
-# ----------------- PERCUSSIVE FILTERS + FEATURES -----------------
+# ----------------- (simple) 1-pole filters (for kernel cleanup) -----------------
 def one_pole_lpf(x: np.ndarray, sr: int, cutoff_hz: float) -> np.ndarray:
     cutoff_hz = float(np.clip(cutoff_hz, 5.0, sr * 0.45))
     a = float(np.exp(-2.0 * np.pi * cutoff_hz / sr))
@@ -161,31 +157,22 @@ def one_pole_lpf(x: np.ndarray, sr: int, cutoff_hz: float) -> np.ndarray:
 
 
 def one_pole_hpf(x: np.ndarray, sr: int, cutoff_hz: float) -> np.ndarray:
-    # HPF simple = x - LPF(x)
     return (x - one_pole_lpf(x, sr, cutoff_hz)).astype(np.float32, copy=False)
 
 
-def bandpass_1pole(x: np.ndarray, sr: int, lo_hz: float, hi_hz: float) -> np.ndarray:
-    lo_hz = float(max(5.0, lo_hz))
-    hi_hz = float(min(sr * 0.45, hi_hz))
-    if hi_hz <= lo_hz:
-        hi_hz = lo_hz + 10.0
-    y = one_pole_hpf(x, sr, lo_hz)
-    y = one_pole_lpf(y, sr, hi_hz)
-    return y.astype(np.float32, copy=False)
-
-
-def extract_perc_features(
+# ----------------- ANALYSIS (split) -----------------
+def extract_multiband_env_and_specenv(
     y: np.ndarray,
     sr: int,
     frame_length: int,
     hop_length: int,
-    transient_smooth_alpha: float,  # reusa tu f0_alpha
     env_smooth_alpha: float,
-    gate_unvoiced: bool,  # lo reusamos como "solo transientes" (opcional)
     spec_smooth_bins: int,
 ):
-    # ---- STFT magnitude ----
+    """
+    Re-usa tu parte buena: env_bands + spec_env (sin pitch).
+    Devuelve también mag para no recalcular STFT en flux/centroid.
+    """
     n_fft = frame_length
     S = lr_stft(
         y.astype(np.float32),
@@ -216,121 +203,331 @@ def extract_perc_features(
         env = env / (np.max(env) + 1e-12)
         env_bands[bi] = env
 
+    for bi in range(4):
+        env_bands[bi] = one_pole_smooth(env_bands[bi], alpha=env_smooth_alpha)
+
     # ---- spectral envelope (timbre) ----
     logmag = np.log(mag + 1e-8).astype(np.float32)
     spec_env_log = smooth_freq_logmag(logmag, smooth_bins=spec_smooth_bins)
     spec_env = np.exp(spec_env_log).astype(np.float32)
 
-    # ---- transient env (spectral flux, estilo onset strength) ----
-    # flux = sum(max(0, logmag[t]-logmag[t-1])) over bins
+    return env_bands, spec_env, mag
+
+
+def extract_transient_and_centroid_from_mag(
+    mag: np.ndarray,
+    sr: int,
+    smooth_alpha: float,
+):
+    """
+    transient_env = spectral flux (log-magnitude), centroid_norm = 0..1
+    """
+    mag = np.asarray(mag, dtype=np.float32)
+    logmag = np.log(mag + 1e-8).astype(np.float32)
+
+    # spectral flux
     d = np.diff(logmag, axis=1)
-    dpos = np.maximum(d, 0.0)
-    flux = np.sum(dpos, axis=0).astype(np.float32)
+    flux = np.sum(np.maximum(d, 0.0), axis=0).astype(np.float32)
     flux = np.concatenate([np.array([0.0], dtype=np.float32), flux], axis=0)
-
-    # normalize + smooth
     flux = flux / (np.max(flux) + 1e-12)
-    flux = one_pole_smooth(flux, alpha=transient_smooth_alpha)
-    # leve "enfatizador" de transiente
-    transient_env = np.clip(flux ** 1.25, 0.0, 1.0).astype(np.float32)
+    flux = one_pole_smooth(flux, alpha=float(np.clip(smooth_alpha, 1e-6, 1.0)))
+    transient_env = np.clip(flux ** 1.15, 0.0, 1.0).astype(np.float32)
 
-    # ---- centroid (brillo / "agudez") ----
+    # centroid norm
+    n_bins = mag.shape[0]
+    freqs = np.linspace(0.0, sr / 2.0, n_bins, dtype=np.float32)
     num = np.sum(mag * freqs[:, None], axis=0).astype(np.float32)
     den = (np.sum(mag, axis=0) + 1e-12).astype(np.float32)
     centroid = (num / den).astype(np.float32)
 
-    # normaliza centroid a 0..1 (grave→0, brillante→1)
     c_lo, c_hi = 80.0, min(8000.0, sr / 2.0)
-    centroid_norm = (centroid - c_lo) / (c_hi - c_lo + 1e-12)
-    centroid_norm = np.clip(centroid_norm, 0.0, 1.0).astype(np.float32)
+    centroid_norm = np.clip((centroid - c_lo) / (c_hi - c_lo + 1e-12), 0.0, 1.0).astype(np.float32)
 
-    # ---- option: gate_unvoiced => "solo transientes" ----
-    if gate_unvoiced:
-        env_bands = env_bands * transient_env[None, :]
-
-    for bi in range(4):
-        env_bands[bi] = one_pole_smooth(env_bands[bi], alpha=env_smooth_alpha)
-
-    return transient_env, centroid_norm, env_bands, spec_env
+    return transient_env, centroid_norm
 
 
-# ----------------- PERCUSSIVE SYNTH -----------------
-def frames_to_samples(frames: np.ndarray, n_samples: int, frame_length: int, hop_length: int) -> np.ndarray:
-    frames = np.asarray(frames, dtype=np.float32)
-    centers = (np.arange(len(frames)) * hop_length + frame_length / 2.0)
-    centers = np.clip(centers, 0, max(0, n_samples - 1)).astype(np.float32)
-    t = np.arange(n_samples, dtype=np.float32)
-    return np.interp(t, centers, frames).astype(np.float32)
+def pick_triggers(transient_env: np.ndarray, thresh: float, min_dist_frames: int) -> np.ndarray:
+    """
+    Peak picking simple.
+    """
+    x = np.asarray(transient_env, dtype=np.float32)
+    thresh = float(thresh)
+    min_dist = int(max(1, min_dist_frames))
+    peaks = []
+    last = -10**9
+    for i in range(1, len(x) - 1):
+        if x[i] >= thresh and x[i] > x[i - 1] and x[i] >= x[i + 1]:
+            if i - last >= min_dist:
+                peaks.append(i)
+                last = i
+    return np.asarray(peaks, dtype=np.int32)
 
 
-def synth_perc_4layers(
+# ----------------- WAVETABLE READ (helpers) -----------------
+def _lerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
+    return a + (b - a) * float(t)
+
+
+def _table_read_linear(table_1d: np.ndarray, phase: np.ndarray) -> np.ndarray:
+    """
+    phase: 0..1
+    """
+    n = len(table_1d)
+    idx = phase * n
+    i0 = np.floor(idx).astype(np.int32)
+    frac = idx - i0
+    i1 = (i0 + 1) % n
+    return (1.0 - frac) * table_1d[i0] + frac * table_1d[i1]
+
+
+def _select_table(mipmaps: list, position: float, level: int) -> np.ndarray:
+    level = int(np.clip(level, 0, len(mipmaps) - 1))
+    tables = mipmaps[level]  # (n_frames, table_size)
+    n_frames = tables.shape[0]
+    pos = float(np.clip(position, 0.0, 1.0))
+    fidx = pos * (n_frames - 1)
+    i0 = int(np.floor(fidx))
+    t = float(fidx - i0)
+    i1 = min(i0 + 1, n_frames - 1)
+    return _lerp(tables[i0], tables[i1], t).astype(np.float32, copy=False)
+
+
+# ----------------- SYNTH (OLA impulse response per hit) -----------------
+def make_wavetable_kernel(
+    mipmaps: list,
+    position: float,
+    mip_strength: float,
+    length_samples: int,
+    sr: int,
+    band: int,
+    centroid_norm: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Kernel = oscilación corta (wavetable) * ventana (exp decay + fade edges).
+    Esto actúa como "respuesta al impulso" para el OLA por golpe.
+    """
+    L = int(max(16, length_samples))
+    cn = float(np.clip(centroid_norm, 0.0, 1.0))
+
+    # mip level (más alto => más anti-alias). Empuja más mip para bandas altas / centroid brillante.
+    n_levels = len(mipmaps)
+    base = float(np.clip(mip_strength, 0.0, 1.0))
+    # leve sesgo por banda y brillo
+    bias = 0.10 * band + 0.35 * cn
+    lvl = int(np.clip(np.floor((base + bias) * (n_levels - 1)), 0, n_levels - 1))
+
+    table = _select_table(mipmaps, position=position, level=lvl)
+    # frecuencia por banda (solo para "color", no melódico)
+    if band == 0:
+        f0 = rng.uniform(45.0, 110.0)
+    elif band == 1:
+        f0 = rng.uniform(110.0, 320.0)
+    elif band == 2:
+        f0 = rng.uniform(320.0, 1200.0)
+    else:
+        f0 = rng.uniform(1200.0, 5200.0)
+
+    # micro-detune dependiente del hit (human)
+    f0 *= float(0.94 + 0.12 * rng.random())
+    f0 = float(np.clip(f0, 20.0, sr * 0.45))
+
+    # phase ramp (0..1)
+    phase = (np.arange(L, dtype=np.float32) * (f0 / float(sr))).astype(np.float32)
+    phase = phase - np.floor(phase)
+
+    # wavetable render
+    k = _table_read_linear(table, phase).astype(np.float32)
+
+    # DC remove + very light HPF protection (20 Hz)
+    k = (k - np.mean(k)).astype(np.float32)
+    k = one_pole_hpf(k, sr, 20.0)
+
+    # envelope: exp decay (band dependent) + edge fade
+    t = np.arange(L, dtype=np.float32) / float(sr)
+    # tau mapping: longer on low bands, shorter on high bands
+    # (scale around 1.0; actual duration already sets L, tau shapes inside that)
+    tau_scale = [1.10, 0.85, 0.55, 0.25][int(np.clip(band, 0, 3))]
+    tau = max(0.002, float(tau_scale) * (L / float(sr)) * 0.55)
+    env = np.exp(-t / tau).astype(np.float32)
+
+    k = (k * env).astype(np.float32)
+    k = _fade_edges(k, fade=min(16, max(4, L // 64)))
+
+    # normalize kernel safely (keeps dynamics per-velocity outside)
+    m = float(np.max(np.abs(k)) + 1e-12)
+    k = (k / m).astype(np.float32)
+
+    return k
+
+
+def ola_render_layer(
     sr: int,
     n_samples: int,
     frame_length: int,
     hop_length: int,
-    transient_env_frames: np.ndarray,
-    centroid_norm_frames: np.ndarray,
-    env_bands: np.ndarray,  # (4, frames)
+    triggers_frames: np.ndarray,
+    transient_env: np.ndarray,
+    env_band: np.ndarray,
+    centroid_norm: np.ndarray,
+    mipmaps: list,
     rng: np.random.Generator,
-):
-    # Up-sample frame envelopes to sample-rate
-    tr = frames_to_samples(transient_env_frames, n_samples, frame_length, hop_length)
-    cn = frames_to_samples(centroid_norm_frames, n_samples, frame_length, hop_length)
+    band: int,
+    pos_min: float,
+    pos_max: float,
+    mip_min: float,
+    mip_max: float,
+    gate_only_hits: bool,
+) -> np.ndarray:
+    out = np.zeros(n_samples, dtype=np.float32)
 
-    # energia por banda a sample-rate
-    e0 = frames_to_samples(env_bands[0], n_samples, frame_length, hop_length)
-    e1 = frames_to_samples(env_bands[1], n_samples, frame_length, hop_length)
-    e2 = frames_to_samples(env_bands[2], n_samples, frame_length, hop_length)
-    e3 = frames_to_samples(env_bands[3], n_samples, frame_length, hop_length)
+    if triggers_frames.size == 0:
+        return out
 
-    # shaping general: ataque fuerte, cola controlada
-    tr_sh = np.clip(tr, 0.0, 1.0) ** 1.1
+    # params
+    pos_lo, pos_hi = float(min(pos_min, pos_max)), float(max(pos_min, pos_max))
+    mip_lo, mip_hi = float(min(mip_min, mip_max)), float(max(mip_min, mip_max))
 
-    # -------- Layer 1: KICK / BODY (resonador amortiguado)
-    # freq base depende de "gravedad": más brillante => un poco más alto
-    f_kick = 45.0 + 65.0 * cn  # 45..110 Hz aprox
-    # pequeño pitch-drop con transiente
-    f_kick = f_kick * (1.0 - 0.35 * tr_sh)
+    # pos/mip "walk"
+    pos = float(rng.uniform(pos_lo, pos_hi))
+    mip = float(rng.uniform(mip_lo, mip_hi))
 
-    phase = np.zeros(n_samples, dtype=np.float32)
-    ph = 0.0
-    for i in range(n_samples):
-        phase[i] = ph
-        ph += float(f_kick[i]) / float(sr)
-        ph -= np.floor(ph)
+    # length ranges (ms)
+    L_ms_lo = [120.0, 70.0, 35.0, 10.0][band]
+    L_ms_hi = [220.0, 140.0, 90.0, 40.0][band]
 
-    kick_osc = np.sin(2.0 * np.pi * phase).astype(np.float32)
-    kick_env = np.clip(e0 * (0.35 + 0.65 * tr_sh), 0.0, 1.0) ** 1.3
-    kick = (kick_osc * kick_env).astype(np.float32)
+    # micro-timing
+    jitter_max = int(sr * 0.004)  # 4 ms
 
-    # -------- Layer 2-4: NOISE per band (snare/hats textures)
-    noise = rng.standard_normal(n_samples).astype(np.float32)
+    # velocity curve
+    gamma = 1.35
 
-    # lowmid: 140..700
-    n1 = bandpass_1pole(noise, sr, 140.0, 700.0)
-    env1 = np.clip(e1 * (0.20 + 0.80 * tr_sh), 0.0, 1.0) ** 1.15
-    layer1 = (n1 * env1).astype(np.float32)
+    # optional: add "fill" hits if gate_only_hits is False (light sustain/roll feeling)
+    # (this is subtle; main groove comes from triggers_frames)
+    if not gate_only_hits:
+        # add quiet micro-triggers on a coarse grid where band energy is present
+        step = 6  # frames
+        fill = []
+        for i in range(0, len(env_band), step):
+            if env_band[i] > 0.08 and transient_env[i] < 0.20:
+                fill.append(i)
+        if fill:
+            triggers_frames = np.unique(np.concatenate([triggers_frames, np.asarray(fill, dtype=np.int32)]))
+            triggers_frames.sort()
 
-    # highmid: 700..4000
-    n2 = bandpass_1pole(noise, sr, 700.0, 4000.0)
-    env2 = np.clip(e2 * (0.25 + 0.75 * tr_sh), 0.0, 1.0) ** 1.05
-    layer2 = (n2 * env2).astype(np.float32)
+    for fr in triggers_frames:
+        fr = int(fr)
+        if fr < 0 or fr >= len(transient_env) or fr >= len(env_band) or fr >= len(centroid_norm):
+            continue
 
-    # high: 4k..(lp 12k) + click
-    n3 = one_pole_hpf(noise, sr, 4000.0)
-    n3 = one_pole_lpf(n3, sr, min(12000.0, sr * 0.45))
-    env3 = np.clip(e3 * (0.35 + 0.65 * tr_sh), 0.0, 1.0) ** 0.95
-    layer3 = (n3 * env3).astype(np.float32)
+        tr = float(transient_env[fr])
+        eb = float(env_band[fr])
+        cn = float(centroid_norm[fr])
 
-    # click: derivada del transiente (ataque)
-    dtr = np.maximum(0.0, np.diff(tr_sh, prepend=0.0)).astype(np.float32)
-    click = (one_pole_hpf(dtr, sr, 2500.0) * 2.0).astype(np.float32)
+        # velocity (hit strength)
+        vel = (tr ** gamma) * eb
+        if vel <= 1e-6:
+            continue
 
-    out = kick + layer1 + layer2 + layer3 + click
-    # control de pico
-    mx = float(np.max(np.abs(out)) + 1e-12)
-    out = (out / mx * 0.95).astype(np.float32)
-    return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
+        # human velocity
+        vel *= float(0.9 + 0.2 * rng.random())
+
+        # compute start sample (centered in frame)
+        start = fr * hop_length + int(frame_length // 2)
+        start += int(rng.integers(-jitter_max, jitter_max + 1))
+        if start < 0:
+            start = 0
+        if start >= n_samples:
+            continue
+
+        # per-hit length
+        L = int(sr * (rng.uniform(L_ms_lo, L_ms_hi) / 1000.0))
+        L = int(np.clip(L, 16, n_samples))
+
+        # pos/mip random walk
+        pos = float(np.clip(pos + rng.normal(0.0, 0.02), pos_lo, pos_hi))
+        mip = float(np.clip(mip + rng.normal(0.0, 0.05), mip_lo, mip_hi))
+
+        # effective mip modulated by brightness: brighter => a bit more mip (more anti-alias)
+        mip_eff = float(np.clip(mip * (0.85 + 0.35 * cn), 0.0, 1.0))
+
+        k = make_wavetable_kernel(
+            mipmaps=mipmaps,
+            position=pos,
+            mip_strength=mip_eff,
+            length_samples=L,
+            sr=sr,
+            band=band,
+            centroid_norm=cn,
+            rng=rng,
+        )
+
+        end = min(n_samples, start + len(k))
+        kk = k[: end - start]
+        out[start:end] += (vel * kk).astype(np.float32)
+
+    return out.astype(np.float32, copy=False)
+
+
+def synth_wavetable_impulse_4layers(
+    sr: int,
+    n_samples: int,
+    frame_length: int,
+    hop_length: int,
+    transient_env: np.ndarray,
+    env_bands: np.ndarray,  # (4, frames)
+    centroid_norm: np.ndarray,
+    wavetable_mipmaps_4: list,  # list of mipmaps per layer [4]
+    rng: np.random.Generator,
+    pos_min: float,
+    pos_max: float,
+    mip_min: float,
+    mip_max: float,
+    gate_only_hits: bool,
+) -> np.ndarray:
+    transient_env = np.asarray(transient_env, dtype=np.float32)
+    centroid_norm = np.asarray(centroid_norm, dtype=np.float32)
+    env_bands = np.asarray(env_bands, dtype=np.float32)
+
+    # triggers (ms->frames)
+    # threshold adapts slightly to overall activity
+    thr = float(np.clip(0.28 + 0.18 * (1.0 - float(np.mean(transient_env))), 0.18, 0.45))
+    min_dist_frames = max(1, int((0.040 * sr) / max(1, hop_length)))  # ~40ms
+    triggers = pick_triggers(transient_env, thresh=thr, min_dist_frames=min_dist_frames)
+
+    # fallback if no peaks (e.g., very flat audio)
+    if triggers.size == 0:
+        triggers = np.arange(0, len(transient_env), max(2, min_dist_frames), dtype=np.int32)
+
+    layers = []
+    for b in range(4):
+        layer = ola_render_layer(
+            sr=sr,
+            n_samples=n_samples,
+            frame_length=frame_length,
+            hop_length=hop_length,
+            triggers_frames=triggers,
+            transient_env=transient_env,
+            env_band=env_bands[b],
+            centroid_norm=centroid_norm,
+            mipmaps=wavetable_mipmaps_4[b],
+            rng=rng,
+            band=b,
+            pos_min=pos_min,
+            pos_max=pos_max,
+            mip_min=mip_min,
+            mip_max=mip_max,
+            gate_only_hits=gate_only_hits,
+        )
+        layers.append(layer)
+
+    mix = np.sum(np.stack(layers, axis=0), axis=0).astype(np.float32)
+
+    # soft clip / peak control
+    mx = float(np.max(np.abs(mix)) + 1e-12)
+    mix = (mix / mx * 0.95).astype(np.float32)
+
+    return np.clip(mix, -1.0, 1.0).astype(np.float32, copy=False)
 
 
 # ----------------- SPECTRAL MATCH -----------------
@@ -431,8 +628,8 @@ class AudioWorker(QObject):
         hop_length: int,
         frame_length: int,
         env_alpha: float,
-        f0_alpha: float,
-        gate_unvoiced: bool,
+        f0_alpha: float,  # reused as transient smooth alpha
+        gate_unvoiced: bool,  # reused as "solo hits"
         output_gain: float,
         enable_spec_match: bool,
         spec_strength: float,
@@ -452,8 +649,8 @@ class AudioWorker(QObject):
         self.hop_length = int(hop_length)
         self.frame_length = int(frame_length)
         self.env_alpha = float(env_alpha)
-        self.f0_alpha = float(f0_alpha)  # ahora = transient_smooth_alpha
-        self.gate_unvoiced = bool(gate_unvoiced)  # ahora = "solo transientes"
+        self.f0_alpha = float(f0_alpha)
+        self.gate_unvoiced = bool(gate_unvoiced)
         self.output_gain = float(output_gain)
         self.enable_spec_match = bool(enable_spec_match)
         self.spec_strength = float(spec_strength)
@@ -476,29 +673,46 @@ class AudioWorker(QObject):
         self.log.emit(f"Fuente: {os.path.basename(src_file)}")
         y, sr = load_mono(src_file)
         self.log.emit(f" len={len(y)} sr={sr}")
-        self.log.emit(" Analizando: transientes + multiband env + spectral envelope...")
+        self.log.emit(" Analizando: env multibanda + spectral envelope + transientes (flux)...")
 
-        transient_env, centroid_norm, env_bands, spec_env = extract_perc_features(
+        env_bands, spec_env, mag = extract_multiband_env_and_specenv(
             y=y,
             sr=sr,
             frame_length=self.frame_length,
             hop_length=self.hop_length,
-            transient_smooth_alpha=self.f0_alpha,  # reutiliza tu control "F0 α"
             env_smooth_alpha=self.env_alpha,
-            gate_unvoiced=self.gate_unvoiced,  # ahora funciona como "solo transientes"
             spec_smooth_bins=self.spec_smooth_bins,
         )
 
-        self.log.emit(" Sintetizando (modo percusivo: kick + noise-bands + click)...")
-        mix = synth_perc_4layers(
+        transient_env, centroid_norm = extract_transient_and_centroid_from_mag(
+            mag=mag,
+            sr=sr,
+            smooth_alpha=self.f0_alpha,  # reusa tu control "F0 α" como suavizado de transiente
+        )
+
+        picks = rng.choice(wavetable_files, size=4, replace=(len(wavetable_files) < 4))
+        mipmaps_4 = []
+        for i in range(4):
+            wt = str(picks[i])
+            mipmaps_4.append(self._load_mipmaps_cached(wt))
+            self.log.emit(f" WT {i+1}: {os.path.basename(wt)}")
+
+        self.log.emit(" Sintetizando: 4 wavetables (impulse train + convolution-like / OLA por golpes)...")
+        mix = synth_wavetable_impulse_4layers(
             sr=sr,
             n_samples=len(y),
             frame_length=self.frame_length,
             hop_length=self.hop_length,
-            transient_env_frames=transient_env,
-            centroid_norm_frames=centroid_norm,
+            transient_env=transient_env,
             env_bands=env_bands,
+            centroid_norm=centroid_norm,
+            wavetable_mipmaps_4=mipmaps_4,
             rng=rng,
+            pos_min=self.pos_min,
+            pos_max=self.pos_max,
+            mip_min=self.mip_min,
+            mip_max=self.mip_max,
+            gate_only_hits=self.gate_unvoiced,  # reinterpretado como "solo hits"
         ).astype(np.float32)
 
         if self.enable_spec_match:
@@ -529,10 +743,9 @@ class AudioWorker(QObject):
             inp = self.input_path
             outp = self.output_path
 
-            # Se mantiene para tu UI; en modo percusivo no se usa, pero no molesta.
             wavetable_files = list_wav_files(self.wt_dir, recursive=True)
             if len(wavetable_files) == 0:
-                self.log.emit("Aviso: No se encontraron .wav en wavetables. (En modo percusivo no es necesario.)")
+                raise RuntimeError("No se encontraron .wav en la carpeta de wavetables (incl. subcarpetas).")
 
             # ✅ RNG: si seed=0 => azar total (entropy del sistema)
             rng = np.random.default_rng(None if self.seed == 0 else self.seed)
@@ -557,8 +770,10 @@ class AudioWorker(QObject):
                         out_file = outp
 
                 self.progress.emit(5)
-                self.log.emit("=== PROCESO SINGLE (PERCUSIVO) ===")
-                self.log.emit(f"Seed={'RANDOM' if self.seed==0 else self.seed}")
+                self.log.emit("=== PROCESO SINGLE (WT-IMPULSE / OLA) ===")
+                self.log.emit(
+                    f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
+                )
                 self._process_one(inp, out_file, wavetable_files, rng)
                 self.progress.emit(100)
                 self.finished.emit()
@@ -577,10 +792,12 @@ class AudioWorker(QObject):
             if not files:
                 raise RuntimeError("No se encontraron audios en la carpeta input.")
 
-            self.log.emit("=== PROCESO BATCH (PERCUSIVO) ===")
+            self.log.emit("=== PROCESO BATCH (WT-IMPULSE / OLA) ===")
             self.log.emit(f"Input: {in_dir}")
             self.log.emit(f"Output: {out_dir}")
-            self.log.emit(f"Seed={'RANDOM' if self.seed==0 else self.seed}")
+            self.log.emit(
+                f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
+            )
 
             self.progress.emit(1)
             total = len(files)
@@ -590,8 +807,6 @@ class AudioWorker(QObject):
                 self.log.emit(f"\n[{idx+1}/{total}]")
                 p = int(5 + 90 * (idx / max(1, total)))
                 self.progress.emit(p)
-
-                # ✅ RNG continuo: completamente random a lo largo del batch
                 self._process_one(src_file, out_file, wavetable_files, rng)
 
             self.progress.emit(100)
@@ -605,7 +820,7 @@ class AudioWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Restaurador por Síntesis (Percusivo 4 capas + timbre match) — Random REAL")
+        self.setWindowTitle("Restaurador por Síntesis (WT Impulse/OLA + Timbre match) — Random REAL")
         self.resize(980, 720)
 
         central = QWidget()
@@ -643,8 +858,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(row_in)
         layout.addLayout(row_out)
 
-        # Wavetables (se mantiene por compat; en modo percusivo no se usa)
-        gb_wt = QGroupBox("Wavetables (random desde carpeta) — (No usado en modo percusivo)")
+        # Wavetables
+        gb_wt = QGroupBox("Wavetables (random desde carpeta)")
         g = QVBoxLayout(gb_wt)
 
         self.wt_dir_edit = QLineEdit(WT_DIR_DEFAULT)
@@ -702,7 +917,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(gb_wt)
 
         # Analysis
-        gb_an = QGroupBox("Análisis (Percusivo)")
+        gb_an = QGroupBox("Análisis")
         a = QHBoxLayout(gb_an)
 
         self.hop_spin = QSpinBox()
