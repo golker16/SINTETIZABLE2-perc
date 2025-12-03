@@ -4,7 +4,6 @@ import glob
 import numpy as np
 import soundfile as sf
 
-# librosa imports mínimos (sin sklearn)
 from librosa.core.audio import load as lr_load
 from librosa.core.spectrum import stft as lr_stft, istft as lr_istft
 
@@ -28,574 +27,20 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QCheckBox,
     QGroupBox,
+    QListWidget,
+    QListWidgetItem,
 )
 
 # ----------------- DEFAULTS -----------------
 DEFAULT_FRAME_LENGTH = 2048
 DEFAULT_HOP_LENGTH = 256
-
-WT_FRAME_SIZE = 2048
-WT_MIP_LEVELS = 8
-WT_DIR_DEFAULT = r"D:\WAVETABLE"
 AUDIO_EXTS = (".wav", ".flac", ".ogg", ".mp3", ".aiff", ".aif", ".m4a")
 
 
-# ----------------- WAVETABLE IO -----------------
-def _to_mono_float(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x)
-    if x.ndim == 2:
-        x = np.mean(x, axis=1)
-    return x.astype(np.float32, copy=False)
-
-
-def _fade_edges(frame: np.ndarray, fade: int = 8) -> np.ndarray:
-    if fade <= 0 or 2 * fade >= len(frame):
-        return frame
-    w = np.linspace(0.0, 1.0, fade, dtype=np.float32)
-    out = frame.copy()
-    out[:fade] *= w
-    out[-fade:] *= w[::-1]
-    return out
-
-
-def _normalize_frame(frame: np.ndarray) -> np.ndarray:
-    m = np.max(np.abs(frame)) + 1e-12
-    return (frame / m).astype(np.float32, copy=False)
-
-
-def _linear_resample(x: np.ndarray, new_len: int) -> np.ndarray:
-    n = len(x)
-    if new_len == n:
-        return x.astype(np.float32, copy=False)
-    src = np.linspace(0.0, 1.0, n, endpoint=False, dtype=np.float32)
-    dst = np.linspace(0.0, 1.0, new_len, endpoint=False, dtype=np.float32)
-    return np.interp(dst, src, x).astype(np.float32, copy=False)
-
-
-def load_wavetable_wav(
-    path: str,
-    frame_size: int = WT_FRAME_SIZE,
-    normalize_each_frame: bool = True,
-    edge_fade: int = 8,
-) -> np.ndarray:
-    audio, _sr = sf.read(path, always_2d=False)
-    audio = _to_mono_float(audio)
-    if len(audio) < frame_size:
-        audio = np.pad(audio, (0, frame_size - len(audio)))
-    n_frames = max(1, len(audio) // frame_size)
-    use_len = n_frames * frame_size
-    audio = audio[:use_len]
-    frames = audio.reshape(n_frames, frame_size).copy()
-    for i in range(n_frames):
-        f = frames[i]
-        f = f - np.mean(f)
-        f = _fade_edges(f, edge_fade)
-        if normalize_each_frame:
-            f = _normalize_frame(f)
-        frames[i] = f
-    return frames.astype(np.float32, copy=False)
-
-
-def build_wavetable_mipmaps(frames: np.ndarray, levels: int = WT_MIP_LEVELS):
-    frames = np.asarray(frames, dtype=np.float32)
-    n_frames, frame_size = frames.shape
-    mipmaps = []
-    cur = frames
-    cur_size = frame_size
-    for _lvl in range(levels):
-        mipmaps.append(cur)
-        next_size = max(32, cur_size // 2)
-        if next_size == cur_size:
-            break
-        nxt = np.zeros((n_frames, next_size), dtype=np.float32)
-        for fi in range(n_frames):
-            nxt[fi] = _linear_resample(cur[fi], next_size)
-        cur = nxt
-        cur_size = next_size
-    return mipmaps
-
-
-# ----------------- AUDIO UTILS -----------------
+# ----------------- I/O -----------------
 def load_mono(path: str):
     y, sr = lr_load(path, sr=None, mono=True)
     return y.astype(np.float32, copy=False), int(sr)
-
-
-def one_pole_smooth(x: np.ndarray, alpha: float) -> np.ndarray:
-    alpha = float(np.clip(alpha, 1e-6, 1.0))
-    y = np.empty_like(x, dtype=np.float32)
-    y[0] = x[0]
-    for i in range(1, len(x)):
-        y[i] = alpha * x[i] + (1.0 - alpha) * y[i - 1]
-    return y
-
-
-def smooth_freq_logmag(logmag: np.ndarray, smooth_bins: int) -> np.ndarray:
-    smooth_bins = int(max(1, smooth_bins))
-    if smooth_bins <= 1:
-        return logmag
-    k = smooth_bins
-    kernel = np.ones(k, dtype=np.float32) / float(k)
-    pad = k // 2
-    padded = np.pad(logmag, ((pad, pad), (0, 0)), mode="reflect")
-    out = np.empty_like(logmag, dtype=np.float32)
-    for t in range(logmag.shape[1]):
-        out[:, t] = np.convolve(padded[:, t], kernel, mode="valid").astype(np.float32)
-    return out
-
-
-# ----------------- (simple) 1-pole filters (for kernel cleanup) -----------------
-def one_pole_lpf(x: np.ndarray, sr: int, cutoff_hz: float) -> np.ndarray:
-    cutoff_hz = float(np.clip(cutoff_hz, 5.0, sr * 0.45))
-    a = float(np.exp(-2.0 * np.pi * cutoff_hz / sr))
-    y = np.empty_like(x, dtype=np.float32)
-    y[0] = x[0]
-    b = 1.0 - a
-    for i in range(1, len(x)):
-        y[i] = b * x[i] + a * y[i - 1]
-    return y
-
-
-def one_pole_hpf(x: np.ndarray, sr: int, cutoff_hz: float) -> np.ndarray:
-    return (x - one_pole_lpf(x, sr, cutoff_hz)).astype(np.float32, copy=False)
-
-
-# ----------------- ANALYSIS (split) -----------------
-def extract_multiband_env_and_specenv(
-    y: np.ndarray,
-    sr: int,
-    frame_length: int,
-    hop_length: int,
-    env_smooth_alpha: float,
-    spec_smooth_bins: int,
-):
-    """
-    Re-usa tu parte buena: env_bands + spec_env (sin pitch).
-    Devuelve también mag para no recalcular STFT en flux/centroid.
-    """
-    n_fft = frame_length
-    S = lr_stft(
-        y.astype(np.float32),
-        n_fft=n_fft,
-        hop_length=hop_length,
-        win_length=frame_length,
-        center=True,
-    )
-    mag = np.abs(S).astype(np.float32)
-    n_bins, n_frames = mag.shape
-
-    freqs = np.linspace(0.0, sr / 2.0, n_bins, dtype=np.float32)
-
-    # ---- multiband env (4 bandas) ----
-    edges = [
-        (20.0, 140.0),  # low
-        (140.0, 700.0),  # lowmid
-        (700.0, 4000.0),  # highmid
-        (4000.0, min(16000.0, sr / 2.0 - 1.0)),  # high
-    ]
-    env_bands = np.zeros((4, n_frames), dtype=np.float32)
-    for bi, (lo, hi) in enumerate(edges):
-        mask = (freqs >= lo) & (freqs < hi)
-        if not np.any(mask):
-            continue
-        band_mag = mag[mask, :]
-        env = np.sqrt(np.mean(band_mag * band_mag, axis=0) + 1e-12).astype(np.float32)
-        env = env / (np.max(env) + 1e-12)
-        env_bands[bi] = env
-
-    for bi in range(4):
-        env_bands[bi] = one_pole_smooth(env_bands[bi], alpha=env_smooth_alpha)
-
-    # ---- spectral envelope (timbre) ----
-    logmag = np.log(mag + 1e-8).astype(np.float32)
-    spec_env_log = smooth_freq_logmag(logmag, smooth_bins=spec_smooth_bins)
-    spec_env = np.exp(spec_env_log).astype(np.float32)
-
-    return env_bands, spec_env, mag
-
-
-def extract_transient_and_centroid_from_mag(
-    mag: np.ndarray,
-    sr: int,
-    smooth_alpha: float,
-):
-    """
-    transient_env = spectral flux (log-magnitude), centroid_norm = 0..1
-    """
-    mag = np.asarray(mag, dtype=np.float32)
-    logmag = np.log(mag + 1e-8).astype(np.float32)
-
-    # spectral flux
-    d = np.diff(logmag, axis=1)
-    flux = np.sum(np.maximum(d, 0.0), axis=0).astype(np.float32)
-    flux = np.concatenate([np.array([0.0], dtype=np.float32), flux], axis=0)
-    flux = flux / (np.max(flux) + 1e-12)
-    flux = one_pole_smooth(flux, alpha=float(np.clip(smooth_alpha, 1e-6, 1.0)))
-    transient_env = np.clip(flux ** 1.15, 0.0, 1.0).astype(np.float32)
-
-    # centroid norm
-    n_bins = mag.shape[0]
-    freqs = np.linspace(0.0, sr / 2.0, n_bins, dtype=np.float32)
-    num = np.sum(mag * freqs[:, None], axis=0).astype(np.float32)
-    den = (np.sum(mag, axis=0) + 1e-12).astype(np.float32)
-    centroid = (num / den).astype(np.float32)
-
-    c_lo, c_hi = 80.0, min(8000.0, sr / 2.0)
-    centroid_norm = np.clip((centroid - c_lo) / (c_hi - c_lo + 1e-12), 0.0, 1.0).astype(np.float32)
-
-    return transient_env, centroid_norm
-
-
-def pick_triggers(transient_env: np.ndarray, thresh: float, min_dist_frames: int) -> np.ndarray:
-    """
-    Peak picking simple.
-    """
-    x = np.asarray(transient_env, dtype=np.float32)
-    thresh = float(thresh)
-    min_dist = int(max(1, min_dist_frames))
-    peaks = []
-    last = -10**9
-    for i in range(1, len(x) - 1):
-        if x[i] >= thresh and x[i] > x[i - 1] and x[i] >= x[i + 1]:
-            if i - last >= min_dist:
-                peaks.append(i)
-                last = i
-    return np.asarray(peaks, dtype=np.int32)
-
-
-# ----------------- WAVETABLE READ (helpers) -----------------
-def _lerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
-    return a + (b - a) * float(t)
-
-
-def _table_read_linear(table_1d: np.ndarray, phase: np.ndarray) -> np.ndarray:
-    """
-    phase: 0..1
-    """
-    n = len(table_1d)
-    idx = phase * n
-    i0 = np.floor(idx).astype(np.int32)
-    frac = idx - i0
-    i1 = (i0 + 1) % n
-    return (1.0 - frac) * table_1d[i0] + frac * table_1d[i1]
-
-
-def _select_table(mipmaps: list, position: float, level: int) -> np.ndarray:
-    level = int(np.clip(level, 0, len(mipmaps) - 1))
-    tables = mipmaps[level]  # (n_frames, table_size)
-    n_frames = tables.shape[0]
-    pos = float(np.clip(position, 0.0, 1.0))
-    fidx = pos * (n_frames - 1)
-    i0 = int(np.floor(fidx))
-    t = float(fidx - i0)
-    i1 = min(i0 + 1, n_frames - 1)
-    return _lerp(tables[i0], tables[i1], t).astype(np.float32, copy=False)
-
-
-# ----------------- SYNTH (OLA impulse response per hit) -----------------
-def make_wavetable_kernel(
-    mipmaps: list,
-    position: float,
-    mip_strength: float,
-    length_samples: int,
-    sr: int,
-    band: int,
-    centroid_norm: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """
-    Kernel = oscilación corta (wavetable) * ventana (exp decay + fade edges).
-    Esto actúa como "respuesta al impulso" para el OLA por golpe.
-    """
-    L = int(max(16, length_samples))
-    cn = float(np.clip(centroid_norm, 0.0, 1.0))
-
-    # mip level (más alto => más anti-alias). Empuja más mip para bandas altas / centroid brillante.
-    n_levels = len(mipmaps)
-    base = float(np.clip(mip_strength, 0.0, 1.0))
-    # leve sesgo por banda y brillo
-    bias = 0.10 * band + 0.35 * cn
-    lvl = int(np.clip(np.floor((base + bias) * (n_levels - 1)), 0, n_levels - 1))
-
-    table = _select_table(mipmaps, position=position, level=lvl)
-    # frecuencia por banda (solo para "color", no melódico)
-    if band == 0:
-        f0 = rng.uniform(45.0, 110.0)
-    elif band == 1:
-        f0 = rng.uniform(110.0, 320.0)
-    elif band == 2:
-        f0 = rng.uniform(320.0, 1200.0)
-    else:
-        f0 = rng.uniform(1200.0, 5200.0)
-
-    # micro-detune dependiente del hit (human)
-    f0 *= float(0.94 + 0.12 * rng.random())
-    f0 = float(np.clip(f0, 20.0, sr * 0.45))
-
-    # phase ramp (0..1)
-    phase = (np.arange(L, dtype=np.float32) * (f0 / float(sr))).astype(np.float32)
-    phase = phase - np.floor(phase)
-
-    # wavetable render
-    k = _table_read_linear(table, phase).astype(np.float32)
-
-    # DC remove + very light HPF protection (20 Hz)
-    k = (k - np.mean(k)).astype(np.float32)
-    k = one_pole_hpf(k, sr, 20.0)
-
-    # envelope: exp decay (band dependent) + edge fade
-    t = np.arange(L, dtype=np.float32) / float(sr)
-    # tau mapping: longer on low bands, shorter on high bands
-    # (scale around 1.0; actual duration already sets L, tau shapes inside that)
-    tau_scale = [1.10, 0.85, 0.55, 0.25][int(np.clip(band, 0, 3))]
-    tau = max(0.002, float(tau_scale) * (L / float(sr)) * 0.55)
-    env = np.exp(-t / tau).astype(np.float32)
-
-    k = (k * env).astype(np.float32)
-    k = _fade_edges(k, fade=min(16, max(4, L // 64)))
-
-    # normalize kernel safely (keeps dynamics per-velocity outside)
-    m = float(np.max(np.abs(k)) + 1e-12)
-    k = (k / m).astype(np.float32)
-
-    return k
-
-
-def ola_render_layer(
-    sr: int,
-    n_samples: int,
-    frame_length: int,
-    hop_length: int,
-    triggers_frames: np.ndarray,
-    transient_env: np.ndarray,
-    env_band: np.ndarray,
-    centroid_norm: np.ndarray,
-    mipmaps: list,
-    rng: np.random.Generator,
-    band: int,
-    pos_min: float,
-    pos_max: float,
-    mip_min: float,
-    mip_max: float,
-    gate_only_hits: bool,
-) -> np.ndarray:
-    out = np.zeros(n_samples, dtype=np.float32)
-
-    if triggers_frames.size == 0:
-        return out
-
-    # params
-    pos_lo, pos_hi = float(min(pos_min, pos_max)), float(max(pos_min, pos_max))
-    mip_lo, mip_hi = float(min(mip_min, mip_max)), float(max(mip_min, mip_max))
-
-    # pos/mip "walk"
-    pos = float(rng.uniform(pos_lo, pos_hi))
-    mip = float(rng.uniform(mip_lo, mip_hi))
-
-    # length ranges (ms)
-    L_ms_lo = [120.0, 70.0, 35.0, 10.0][band]
-    L_ms_hi = [220.0, 140.0, 90.0, 40.0][band]
-
-    # micro-timing
-    jitter_max = int(sr * 0.004)  # 4 ms
-
-    # velocity curve
-    gamma = 1.35
-
-    # optional: add "fill" hits if gate_only_hits is False (light sustain/roll feeling)
-    # (this is subtle; main groove comes from triggers_frames)
-    if not gate_only_hits:
-        # add quiet micro-triggers on a coarse grid where band energy is present
-        step = 6  # frames
-        fill = []
-        for i in range(0, len(env_band), step):
-            if env_band[i] > 0.08 and transient_env[i] < 0.20:
-                fill.append(i)
-        if fill:
-            triggers_frames = np.unique(np.concatenate([triggers_frames, np.asarray(fill, dtype=np.int32)]))
-            triggers_frames.sort()
-
-    for fr in triggers_frames:
-        fr = int(fr)
-        if fr < 0 or fr >= len(transient_env) or fr >= len(env_band) or fr >= len(centroid_norm):
-            continue
-
-        tr = float(transient_env[fr])
-        eb = float(env_band[fr])
-        cn = float(centroid_norm[fr])
-
-        # velocity (hit strength)
-        vel = (tr ** gamma) * eb
-        if vel <= 1e-6:
-            continue
-
-        # human velocity
-        vel *= float(0.9 + 0.2 * rng.random())
-
-        # compute start sample (centered in frame)
-        start = fr * hop_length + int(frame_length // 2)
-        start += int(rng.integers(-jitter_max, jitter_max + 1))
-        if start < 0:
-            start = 0
-        if start >= n_samples:
-            continue
-
-        # per-hit length
-        L = int(sr * (rng.uniform(L_ms_lo, L_ms_hi) / 1000.0))
-        L = int(np.clip(L, 16, n_samples))
-
-        # pos/mip random walk
-        pos = float(np.clip(pos + rng.normal(0.0, 0.02), pos_lo, pos_hi))
-        mip = float(np.clip(mip + rng.normal(0.0, 0.05), mip_lo, mip_hi))
-
-        # effective mip modulated by brightness: brighter => a bit more mip (more anti-alias)
-        mip_eff = float(np.clip(mip * (0.85 + 0.35 * cn), 0.0, 1.0))
-
-        k = make_wavetable_kernel(
-            mipmaps=mipmaps,
-            position=pos,
-            mip_strength=mip_eff,
-            length_samples=L,
-            sr=sr,
-            band=band,
-            centroid_norm=cn,
-            rng=rng,
-        )
-
-        end = min(n_samples, start + len(k))
-        kk = k[: end - start]
-        out[start:end] += (vel * kk).astype(np.float32)
-
-    return out.astype(np.float32, copy=False)
-
-
-def synth_wavetable_impulse_4layers(
-    sr: int,
-    n_samples: int,
-    frame_length: int,
-    hop_length: int,
-    transient_env: np.ndarray,
-    env_bands: np.ndarray,  # (4, frames)
-    centroid_norm: np.ndarray,
-    wavetable_mipmaps_4: list,  # list of mipmaps per layer [4]
-    rng: np.random.Generator,
-    pos_min: float,
-    pos_max: float,
-    mip_min: float,
-    mip_max: float,
-    gate_only_hits: bool,
-) -> np.ndarray:
-    transient_env = np.asarray(transient_env, dtype=np.float32)
-    centroid_norm = np.asarray(centroid_norm, dtype=np.float32)
-    env_bands = np.asarray(env_bands, dtype=np.float32)
-
-    # triggers (ms->frames)
-    # threshold adapts slightly to overall activity
-    thr = float(np.clip(0.28 + 0.18 * (1.0 - float(np.mean(transient_env))), 0.18, 0.45))
-    min_dist_frames = max(1, int((0.040 * sr) / max(1, hop_length)))  # ~40ms
-    triggers = pick_triggers(transient_env, thresh=thr, min_dist_frames=min_dist_frames)
-
-    # fallback if no peaks (e.g., very flat audio)
-    if triggers.size == 0:
-        triggers = np.arange(0, len(transient_env), max(2, min_dist_frames), dtype=np.int32)
-
-    layers = []
-    for b in range(4):
-        layer = ola_render_layer(
-            sr=sr,
-            n_samples=n_samples,
-            frame_length=frame_length,
-            hop_length=hop_length,
-            triggers_frames=triggers,
-            transient_env=transient_env,
-            env_band=env_bands[b],
-            centroid_norm=centroid_norm,
-            mipmaps=wavetable_mipmaps_4[b],
-            rng=rng,
-            band=b,
-            pos_min=pos_min,
-            pos_max=pos_max,
-            mip_min=mip_min,
-            mip_max=mip_max,
-            gate_only_hits=gate_only_hits,
-        )
-        layers.append(layer)
-
-    mix = np.sum(np.stack(layers, axis=0), axis=0).astype(np.float32)
-
-    # soft clip / peak control
-    mx = float(np.max(np.abs(mix)) + 1e-12)
-    mix = (mix / mx * 0.95).astype(np.float32)
-
-    return np.clip(mix, -1.0, 1.0).astype(np.float32, copy=False)
-
-
-# ----------------- SPECTRAL MATCH -----------------
-def spectral_envelope_match(
-    y_syn: np.ndarray,
-    sr: int,
-    spec_env_src: np.ndarray,  # (bins, frames)
-    frame_length: int,
-    hop_length: int,
-    spec_smooth_bins: int,
-    strength: float,
-    clamp_lo: float,
-    clamp_hi: float,
-):
-    strength = float(np.clip(strength, 0.0, 1.0))
-    if strength <= 0.0:
-        return y_syn
-
-    n_fft = frame_length
-    S = lr_stft(
-        y_syn.astype(np.float32),
-        n_fft=n_fft,
-        hop_length=hop_length,
-        win_length=frame_length,
-        center=True,
-    )
-    mag = np.abs(S).astype(np.float32)
-    phase = np.angle(S).astype(np.float32)
-
-    logmag = np.log(mag + 1e-8).astype(np.float32)
-    spec_env_syn_log = smooth_freq_logmag(logmag, smooth_bins=spec_smooth_bins)
-    spec_env_syn = np.exp(spec_env_syn_log).astype(np.float32)
-
-    bins = min(spec_env_src.shape[0], spec_env_syn.shape[0], mag.shape[0])
-    frames = min(spec_env_src.shape[1], spec_env_syn.shape[1], mag.shape[1])
-
-    src = spec_env_src[:bins, :frames]
-    syn = spec_env_syn[:bins, :frames]
-    mag_use = mag[:bins, :frames]
-    ph_use = phase[:bins, :frames]
-
-    G = src / (syn + 1e-12)
-    G = np.clip(G, float(clamp_lo), float(clamp_hi)).astype(np.float32)
-
-    mag_out = mag_use * np.power(G, strength).astype(np.float32)
-    S_out = mag_out * (np.cos(ph_use) + 1j * np.sin(ph_use))
-
-    y_out = lr_istft(
-        S_out,
-        hop_length=hop_length,
-        win_length=frame_length,
-        center=True,
-        length=len(y_syn),
-    )
-    y_out = np.asarray(y_out, dtype=np.float32)
-    return np.clip(y_out, -1.0, 1.0).astype(np.float32, copy=False)
-
-
-# ----------------- FILE LISTING -----------------
-def list_wav_files(folder: str, recursive: bool = True):
-    if not folder or not os.path.isdir(folder):
-        return []
-    pattern = "**/*.wav" if recursive else "*.wav"
-    files = glob.glob(os.path.join(folder, pattern), recursive=recursive)
-    files += glob.glob(os.path.join(folder, pattern.upper()), recursive=recursive)
-    files = [f for f in files if os.path.isfile(f)]
-    files.sort(key=lambda p: p.lower())
-    return files
 
 
 def list_audio_files(folder: str):
@@ -608,6 +53,444 @@ def list_audio_files(folder: str):
     return files
 
 
+# ----------------- DSP utils -----------------
+def one_pole_smooth(x: np.ndarray, alpha: float) -> np.ndarray:
+    alpha = float(np.clip(alpha, 1e-6, 1.0))
+    y = np.empty_like(x, dtype=np.float32)
+    y[0] = x[0]
+    for i in range(1, len(x)):
+        y[i] = alpha * x[i] + (1.0 - alpha) * y[i - 1]
+    return y
+
+
+def smooth_freq(x: np.ndarray, k: int) -> np.ndarray:
+    """moving average along freq bins; x: (bins,) or (bins, frames)"""
+    k = int(max(1, k))
+    if k <= 1:
+        return x
+    kernel = np.ones(k, dtype=np.float32) / float(k)
+    pad = k // 2
+    if x.ndim == 1:
+        xp = np.pad(x, (pad, pad), mode="reflect")
+        return np.convolve(xp, kernel, mode="valid").astype(np.float32)
+    bins, frames = x.shape
+    out = np.empty_like(x, dtype=np.float32)
+    xp = np.pad(x, ((pad, pad), (0, 0)), mode="reflect")
+    for t in range(frames):
+        out[:, t] = np.convolve(xp[:, t], kernel, mode="valid").astype(np.float32)
+    return out
+
+
+def frame_centers_samples(n_frames: int, frame_length: int, hop_length: int, n_samples: int) -> np.ndarray:
+    centers = (np.arange(n_frames) * hop_length + frame_length / 2.0)
+    return np.clip(centers, 0, max(0, n_samples - 1)).astype(np.int64)
+
+
+def hann(n: int) -> np.ndarray:
+    if n <= 1:
+        return np.ones(n, dtype=np.float32)
+    t = np.arange(n, dtype=np.float32)
+    return (0.5 - 0.5 * np.cos(2.0 * np.pi * t / (n - 1))).astype(np.float32)
+
+
+def remove_dc_and_fade(x: np.ndarray, fade_ms: float, sr: int) -> np.ndarray:
+    y = x.astype(np.float32, copy=True)
+    y -= float(np.mean(y))
+    fade = int(max(1, fade_ms * 0.001 * sr))
+    fade = min(fade, len(y) // 4)
+    if fade > 0:
+        w = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+        y[:fade] *= w
+        y[-fade:] *= w[::-1]
+    return y
+
+
+# ----------------- Trigger detection (spectral flux) -----------------
+def spectral_flux_triggers(
+    y: np.ndarray,
+    sr: int,
+    frame_length: int,
+    hop_length: int,
+    flux_smooth_alpha: float,
+    thresh_rel: float,
+    min_dist_ms: float,
+):
+    """
+    Returns dict with:
+      trig_frames (int32), vel (float32 0..1), flux (float32 0..1),
+      mag (bins, frames), freqs (bins,),
+      stats: thr, med, min_dist_frames
+    """
+    S = lr_stft(
+        y.astype(np.float32),
+        n_fft=frame_length,
+        hop_length=hop_length,
+        win_length=frame_length,
+        center=True,
+    )
+    mag = np.abs(S).astype(np.float32)
+    logmag = np.log(mag + 1e-8).astype(np.float32)
+
+    d = np.diff(logmag, axis=1)
+    dpos = np.maximum(d, 0.0)
+    flux = np.sum(dpos, axis=0).astype(np.float32)
+    flux = np.concatenate([np.array([0.0], dtype=np.float32), flux], axis=0)
+
+    flux /= (np.max(flux) + 1e-12)
+    flux = one_pole_smooth(flux, alpha=flux_smooth_alpha)
+    flux = np.clip(flux, 0.0, 1.0).astype(np.float32)
+
+    med = float(np.median(flux))
+    thr = max(med + (1.0 - med) * float(np.clip(thresh_rel, 0.0, 1.0)), 0.02)
+
+    min_dist_frames = int(max(1, (min_dist_ms * 0.001 * sr) / hop_length))
+
+    peaks = []
+    last = -10**9
+    for t in range(1, len(flux) - 1):
+        if t - last < min_dist_frames:
+            continue
+        if flux[t] >= thr and flux[t] >= flux[t - 1] and flux[t] >= flux[t + 1]:
+            peaks.append(t)
+            last = t
+
+    trig_frames = np.array(peaks, dtype=np.int32)
+    vel = np.zeros(len(trig_frames), dtype=np.float32)
+    if len(trig_frames) > 0:
+        vel = flux[trig_frames].astype(np.float32)
+        vel = vel / (np.max(vel) + 1e-12)
+        vel = np.clip(vel, 0.0, 1.0).astype(np.float32)
+
+    freqs = np.linspace(0.0, sr / 2.0, mag.shape[0], dtype=np.float32)
+
+    return {
+        "trig_frames": trig_frames,
+        "vel": vel,
+        "flux": flux,
+        "mag": mag,
+        "freqs": freqs,
+        "stats": {"thr": thr, "med": med, "min_dist_frames": min_dist_frames},
+    }
+
+
+# ----------------- Per-event analysis -----------------
+def extract_attack_env(mag: np.ndarray, t0: int, attack_frames: int, smooth_bins: int) -> np.ndarray:
+    t1 = min(mag.shape[1], t0 + max(1, attack_frames))
+    seg = mag[:, t0:t1]
+    if seg.shape[1] == 0:
+        E = np.mean(mag, axis=1).astype(np.float32)
+    else:
+        E = np.mean(seg, axis=1).astype(np.float32)
+    E = smooth_freq(E, smooth_bins)
+    E /= (np.max(E) + 1e-12)
+    return np.clip(E, 0.0, 1.0).astype(np.float32)
+
+
+def tonalness_score(mag: np.ndarray, t0: int, win_frames: int = 8) -> float:
+    t1 = min(mag.shape[1], t0 + max(1, win_frames))
+    seg = mag[:, t0:t1]
+    if seg.size == 0:
+        return 0.0
+    m = np.mean(seg, axis=1).astype(np.float32)
+    tot = float(np.sum(m) + 1e-12)
+    K = min(32, len(m))
+    top = float(np.sum(np.partition(m, -K)[-K:]))
+    return float(np.clip(top / tot, 0.0, 1.0))
+
+
+def pick_modal_freqs(
+    mag: np.ndarray,
+    freqs: np.ndarray,
+    t0: int,
+    win_frames: int = 10,
+    f_lo: float = 30.0,
+    f_hi: float = 6000.0,
+    K: int = 4,
+):
+    t1 = min(mag.shape[1], t0 + max(1, win_frames))
+    seg = mag[:, t0:t1]
+    if seg.size == 0:
+        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
+
+    m = np.mean(seg, axis=1).astype(np.float32)
+    mask = (freqs >= f_lo) & (freqs <= f_hi)
+    idx = np.where(mask)[0]
+    if len(idx) < 12:
+        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
+
+    m2 = m[idx]
+    peaks = []
+    for i in range(1, len(m2) - 1):
+        if m2[i] > m2[i - 1] and m2[i] > m2[i + 1]:
+            peaks.append(i)
+    if not peaks:
+        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
+
+    peaks = np.array(peaks, dtype=np.int32)
+    vals = m2[peaks]
+    order = np.argsort(vals)[::-1][:K]
+    sel = peaks[order]
+    f_sel = freqs[idx[sel]].astype(np.float32)
+    a_sel = vals[order].astype(np.float32)
+    a_sel /= (np.max(a_sel) + 1e-12)
+    return f_sel, a_sel
+
+
+# ----------------- Kernel synthesis (reconstruction) -----------------
+def make_click(sr: int, length_samples: int) -> np.ndarray:
+    n = int(length_samples)
+    t = np.arange(n, dtype=np.float32)
+    c = 0.15 * (n - 1)
+    sigma = max(1.0, 0.08 * n)
+    g = np.exp(-0.5 * ((t - c) / sigma) ** 2).astype(np.float32)
+    dg = np.diff(g, prepend=g[0]).astype(np.float32)
+    dg *= hann(n)
+    dg /= (np.max(np.abs(dg)) + 1e-12)
+    return dg.astype(np.float32)
+
+
+def shape_noise_to_env(
+    sr: int,
+    env_f: np.ndarray,     # (bins,) 0..1
+    frame_length: int,
+    hop_length: int,
+    length_samples: int,
+    rng: np.random.Generator,
+    time_env: np.ndarray | None = None,  # (frames,)
+):
+    n = int(length_samples)
+    noise = rng.standard_normal(n).astype(np.float32)
+    noise *= hann(n)
+
+    S = lr_stft(noise, n_fft=frame_length, hop_length=hop_length, win_length=frame_length, center=True)
+    ph = np.angle(S).astype(np.float32)
+    bins, frames = S.shape
+
+    env = env_f[:bins].astype(np.float32)
+    env = env / (np.max(env) + 1e-12)
+
+    if time_env is None:
+        mag_tgt = env[:, None] * np.ones((1, frames), dtype=np.float32)
+    else:
+        te = time_env[:frames].astype(np.float32)
+        te = np.clip(te, 0.0, 1.0)
+        mag_tgt = env[:, None] * te[None, :]
+
+    # conserva: evita “harsh”
+    mag_tgt = np.clip(mag_tgt, 0.0, 1.0)
+
+    S_out = mag_tgt * (np.cos(ph) + 1j * np.sin(ph))
+    y = lr_istft(S_out, hop_length=hop_length, win_length=frame_length, center=True, length=n)
+    y = np.asarray(y, dtype=np.float32)
+    y = remove_dc_and_fade(y, fade_ms=0.4, sr=sr)
+    y /= (np.max(np.abs(y)) + 1e-12)
+    return y.astype(np.float32)
+
+
+def render_modal_tail(
+    sr: int,
+    freqs_hz: np.ndarray,
+    amps: np.ndarray,
+    length_samples: int,
+    tau_ms: float,
+    rng: np.random.Generator,
+):
+    n = int(length_samples)
+    if len(freqs_hz) == 0:
+        return np.zeros(n, dtype=np.float32)
+
+    t = np.arange(n, dtype=np.float32) / float(sr)
+    tau = max(1e-3, float(tau_ms) * 0.001)
+    env = np.exp(-t / tau).astype(np.float32)
+
+    y = np.zeros(n, dtype=np.float32)
+    for f, a in zip(freqs_hz, amps):
+        ph0 = float(rng.uniform(0.0, 2.0 * np.pi))
+        y += (float(a) * np.sin(2.0 * np.pi * float(f) * t + ph0)).astype(np.float32)
+
+    y *= env
+    y *= hann(n)
+    y = remove_dc_and_fade(y, fade_ms=0.4, sr=sr)
+    y /= (np.max(np.abs(y)) + 1e-12)
+    return y.astype(np.float32)
+
+
+def highband_air(sr: int, length_samples: int, rng: np.random.Generator, hp_hz: float = 9000.0):
+    n = int(length_samples)
+    x = rng.standard_normal(n).astype(np.float32)
+    x *= hann(n)
+    X = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(n, d=1.0 / sr).astype(np.float32)
+    mask = (freqs >= float(hp_hz)).astype(np.float32)
+    X *= mask
+    y = np.fft.irfft(X, n=n).astype(np.float32)
+    y = remove_dc_and_fade(y, fade_ms=0.3, sr=sr)
+    y /= (np.max(np.abs(y)) + 1e-12)
+    return y.astype(np.float32)
+
+
+def make_event_kernel(
+    sr: int,
+    frame_length: int,
+    hop_length: int,
+    env_f_attack: np.ndarray,
+    vel: float,
+    tonal_strength: float,
+    freqs_modal: np.ndarray,
+    amps_modal: np.ndarray,
+    rng: np.random.Generator,
+    # ms parameters
+    click_ms: float,
+    noise_ms: float,
+    tail_ms: float,
+    air_ms: float,
+    air_amount: float,
+):
+    vel = float(np.clip(vel, 0.0, 1.0))
+    tonal_strength = float(np.clip(tonal_strength, 0.0, 1.0))
+
+    n_click = int(max(8, click_ms * 0.001 * sr))
+    n_noise = int(max(32, noise_ms * 0.001 * sr))
+    n_tail = int(max(64, tail_ms * 0.001 * sr))
+    n_air = int(max(32, air_ms * 0.001 * sr))
+
+    click = make_click(sr, n_click)
+    click *= (0.55 + 0.70 * vel)
+
+    frames_noise = max(1, int(np.ceil(n_noise / hop_length)) + 2)
+    te = (np.linspace(1.0, 0.0, frames_noise, dtype=np.float32) ** 1.6).astype(np.float32)
+
+    noise = shape_noise_to_env(
+        sr=sr,
+        env_f=env_f_attack,
+        frame_length=frame_length,
+        hop_length=hop_length,
+        length_samples=n_noise,
+        rng=rng,
+        time_env=te,
+    )
+    noise *= (0.30 + 0.95 * vel)
+
+    tail = np.zeros(n_tail, dtype=np.float32)
+    if tonal_strength > 0.22 and len(freqs_modal) > 0:
+        tau_ms = 35.0 + 220.0 * tonal_strength
+        tail = render_modal_tail(sr, freqs_modal, amps_modal, n_tail, tau_ms=tau_ms, rng=rng)
+        tail *= (0.22 + 0.95 * vel) * (0.25 + 0.75 * tonal_strength)
+
+    air = np.zeros(n_air, dtype=np.float32)
+    if air_amount > 0.0:
+        air = highband_air(sr, n_air, rng=rng, hp_hz=9000.0)
+        air *= float(np.clip(air_amount, 0.0, 2.0)) * (0.08 + 0.35 * vel)
+
+    n = max(n_click, n_noise, n_tail, n_air)
+    out = np.zeros(n, dtype=np.float32)
+    out[:n_click] += click
+    out[:n_noise] += noise
+    out[:n_tail] += tail
+    out[:n_air] += air
+
+    # human-ish micro variation
+    out *= float(0.90 + 0.20 * rng.random())
+
+    out = remove_dc_and_fade(out, fade_ms=0.6, sr=sr)
+    out /= (np.max(np.abs(out)) + 1e-12)
+    out *= 0.95
+    return out.astype(np.float32)
+
+
+# ----------------- Event-based reconstruction -----------------
+def reconstruct_by_events(
+    y: np.ndarray,
+    sr: int,
+    frame_length: int,
+    hop_length: int,
+    flux_smooth_alpha: float,
+    thresh_rel: float,
+    min_dist_ms: float,
+    attack_frames: int,
+    env_smooth_bins: int,
+    only_hits: bool,
+    air_amount: float,
+    rng: np.random.Generator,
+):
+    det = spectral_flux_triggers(
+        y=y,
+        sr=sr,
+        frame_length=frame_length,
+        hop_length=hop_length,
+        flux_smooth_alpha=flux_smooth_alpha,
+        thresh_rel=thresh_rel,
+        min_dist_ms=min_dist_ms,
+    )
+    trig_frames = det["trig_frames"]
+    vel = det["vel"]
+    flux = det["flux"]
+    mag = det["mag"]
+    freqs = det["freqs"]
+    stats = det["stats"]
+
+    n_samples = len(y)
+    out = np.zeros(n_samples, dtype=np.float32)
+    if len(trig_frames) == 0:
+        return out, det
+
+    centers = frame_centers_samples(mag.shape[1], frame_length, hop_length, n_samples)
+
+    # if not only_hits: option to keep low-level bed (very low) - disabled by default
+    bed = np.zeros(n_samples, dtype=np.float32)
+    if not only_hits:
+        # tiny “bed” derived from flux (just to avoid total dryness if desired)
+        # intentionally conservative
+        bed_strength = 0.02
+        frames_cent = centers.astype(np.float32)
+        t = np.arange(n_samples, dtype=np.float32)
+        env = np.interp(t, frames_cent, flux.astype(np.float32)).astype(np.float32)
+        bed = (env ** 1.2) * bed_strength
+
+    # per-event synthesis
+    for k, t0 in enumerate(trig_frames):
+        start_s = int(centers[t0])
+        v = float(vel[k])
+
+        env_f = extract_attack_env(mag, t0, attack_frames=attack_frames, smooth_bins=env_smooth_bins)
+        ton = tonalness_score(mag, t0, win_frames=8)
+        f_modal, a_modal = pick_modal_freqs(mag, freqs, t0, win_frames=10, K=4)
+
+        # adaptive lengths (ms)
+        # tonal -> longer tail, transient-> shorter
+        tail_ms = 60.0 + 260.0 * float(np.clip(ton, 0.0, 1.0))
+        noise_ms = 22.0 + 75.0 * float(np.clip(1.0 - ton, 0.0, 1.0))
+
+        ker = make_event_kernel(
+            sr=sr,
+            frame_length=frame_length,
+            hop_length=hop_length,
+            env_f_attack=env_f,
+            vel=v,
+            tonal_strength=ton,
+            freqs_modal=f_modal,
+            amps_modal=a_modal,
+            rng=rng,
+            click_ms=8.0,
+            noise_ms=noise_ms,
+            tail_ms=tail_ms,
+            air_ms=28.0,
+            air_amount=air_amount,
+        )
+
+        # overlap-add
+        end_s = min(n_samples, start_s + len(ker))
+        if end_s > start_s:
+            out[start_s:end_s] += ker[: end_s - start_s]
+
+    out += bed.astype(np.float32)
+
+    # peak control
+    mx = float(np.max(np.abs(out)) + 1e-12)
+    out = (out / mx * 0.95).astype(np.float32)
+    return out, det
+
+
 # ----------------- WORKER -----------------
 class AudioWorker(QObject):
     progress = Signal(int)
@@ -617,201 +500,124 @@ class AudioWorker(QObject):
 
     def __init__(
         self,
-        input_path: str,
+        input_files: list,
         output_path: str,
-        wt_dir: str,
-        seed: int,  # 0 => azar total
-        pos_min: float,
-        pos_max: float,
-        mip_min: float,
-        mip_max: float,
+        seed: int,
         hop_length: int,
         frame_length: int,
-        env_alpha: float,
-        f0_alpha: float,  # reused as transient smooth alpha
-        gate_unvoiced: bool,  # reused as "solo hits"
+        flux_alpha: float,
+        trig_thresh: float,
+        min_dist_ms: float,
+        attack_frames: int,
+        env_smooth_bins: int,
+        only_hits: bool,
+        air_amount: float,
         output_gain: float,
-        enable_spec_match: bool,
-        spec_strength: float,
-        spec_smooth_bins: int,
-        spec_clamp_lo: float,
-        spec_clamp_hi: float,
     ):
         super().__init__()
-        self.input_path = input_path
-        self.output_path = output_path
-        self.wt_dir = wt_dir
+        self.input_files = list(input_files)
+        self.output_path = str(output_path)
         self.seed = int(seed)
-        self.pos_min = float(pos_min)
-        self.pos_max = float(pos_max)
-        self.mip_min = float(mip_min)
-        self.mip_max = float(mip_max)
         self.hop_length = int(hop_length)
         self.frame_length = int(frame_length)
-        self.env_alpha = float(env_alpha)
-        self.f0_alpha = float(f0_alpha)
-        self.gate_unvoiced = bool(gate_unvoiced)
+        self.flux_alpha = float(flux_alpha)
+        self.trig_thresh = float(trig_thresh)
+        self.min_dist_ms = float(min_dist_ms)
+        self.attack_frames = int(attack_frames)
+        self.env_smooth_bins = int(env_smooth_bins)
+        self.only_hits = bool(only_hits)
+        self.air_amount = float(air_amount)
         self.output_gain = float(output_gain)
-        self.enable_spec_match = bool(enable_spec_match)
-        self.spec_strength = float(spec_strength)
-        self.spec_smooth_bins = int(spec_smooth_bins)
-        self.spec_clamp_lo = float(spec_clamp_lo)
-        self.spec_clamp_hi = float(spec_clamp_hi)
-        self._mipmap_cache = {}
 
-    def _load_mipmaps_cached(self, wt_path: str):
-        wt_path = os.path.abspath(wt_path)
-        mm = self._mipmap_cache.get(wt_path)
-        if mm is not None:
-            return mm
-        frames = load_wavetable_wav(wt_path, frame_size=WT_FRAME_SIZE)
-        mipmaps = build_wavetable_mipmaps(frames, levels=WT_MIP_LEVELS)
-        self._mipmap_cache[wt_path] = mipmaps
-        return mipmaps
+    def _resolve_outfile(self, src_file: str) -> str:
+        outp = self.output_path
+        if os.path.isdir(outp) or outp.endswith(os.sep) or (os.path.splitext(outp)[1].lower() != ".wav"):
+            os.makedirs(outp, exist_ok=True)
+            base = os.path.splitext(os.path.basename(src_file))[0]
+            return os.path.join(outp, base + "__recon.wav")
+        return outp
 
-    def _process_one(self, src_file: str, out_file: str, wavetable_files: list, rng: np.random.Generator):
+    def _process_one(self, src_file: str, out_file: str, rng: np.random.Generator):
         self.log.emit(f"Fuente: {os.path.basename(src_file)}")
         y, sr = load_mono(src_file)
-        self.log.emit(f" len={len(y)} sr={sr}")
-        self.log.emit(" Analizando: env multibanda + spectral envelope + transientes (flux)...")
+        dur = len(y) / float(sr)
+        self.log.emit(f" sr={sr}  samples={len(y)}  dur={dur:.3f}s")
+        self.log.emit(
+            f" Params: frame={self.frame_length} hop={self.hop_length} | fluxα={self.flux_alpha:.3f} "
+            f"thr={self.trig_thresh:.3f} minDist={self.min_dist_ms:.1f}ms | attackFrames={self.attack_frames} "
+            f"smoothBins={self.env_smooth_bins} | onlyHits={self.only_hits} air={self.air_amount:.2f}"
+        )
 
-        env_bands, spec_env, mag = extract_multiband_env_and_specenv(
+        y_rec, det = reconstruct_by_events(
             y=y,
             sr=sr,
             frame_length=self.frame_length,
             hop_length=self.hop_length,
-            env_smooth_alpha=self.env_alpha,
-            spec_smooth_bins=self.spec_smooth_bins,
-        )
-
-        transient_env, centroid_norm = extract_transient_and_centroid_from_mag(
-            mag=mag,
-            sr=sr,
-            smooth_alpha=self.f0_alpha,  # reusa tu control "F0 α" como suavizado de transiente
-        )
-
-        picks = rng.choice(wavetable_files, size=4, replace=(len(wavetable_files) < 4))
-        mipmaps_4 = []
-        for i in range(4):
-            wt = str(picks[i])
-            mipmaps_4.append(self._load_mipmaps_cached(wt))
-            self.log.emit(f" WT {i+1}: {os.path.basename(wt)}")
-
-        self.log.emit(" Sintetizando: 4 wavetables (impulse train + convolution-like / OLA por golpes)...")
-        mix = synth_wavetable_impulse_4layers(
-            sr=sr,
-            n_samples=len(y),
-            frame_length=self.frame_length,
-            hop_length=self.hop_length,
-            transient_env=transient_env,
-            env_bands=env_bands,
-            centroid_norm=centroid_norm,
-            wavetable_mipmaps_4=mipmaps_4,
+            flux_smooth_alpha=self.flux_alpha,
+            thresh_rel=self.trig_thresh,
+            min_dist_ms=self.min_dist_ms,
+            attack_frames=self.attack_frames,
+            env_smooth_bins=self.env_smooth_bins,
+            only_hits=self.only_hits,
+            air_amount=self.air_amount,
             rng=rng,
-            pos_min=self.pos_min,
-            pos_max=self.pos_max,
-            mip_min=self.mip_min,
-            mip_max=self.mip_max,
-            gate_only_hits=self.gate_unvoiced,  # reinterpretado como "solo hits"
-        ).astype(np.float32)
+        )
 
-        if self.enable_spec_match:
-            self.log.emit(" Aplicando spectral envelope match (timbre)...")
-            mix = spectral_envelope_match(
-                y_syn=mix,
-                sr=sr,
-                spec_env_src=spec_env,
-                frame_length=self.frame_length,
-                hop_length=self.hop_length,
-                spec_smooth_bins=self.spec_smooth_bins,
-                strength=self.spec_strength,
-                clamp_lo=self.spec_clamp_lo,
-                clamp_hi=self.spec_clamp_hi,
-            )
+        trig_frames = det["trig_frames"]
+        vel = det["vel"]
+        stats = det["stats"]
+        self.log.emit(
+            f" Triggers: {len(trig_frames)} | medianFlux={stats['med']:.3f} thrAbs={stats['thr']:.3f} "
+            f"minDistFrames={stats['min_dist_frames']}"
+        )
+        if len(trig_frames) > 0:
+            # show first few trigger times
+            centers = frame_centers_samples(det["mag"].shape[1], self.frame_length, self.hop_length, len(y))
+            show = min(8, len(trig_frames))
+            times_ms = (centers[trig_frames[:show]] / float(sr) * 1000.0)
+            vshow = vel[:show]
+            pairs = ", ".join([f"{times_ms[i]:.1f}ms(v={vshow[i]:.2f})" for i in range(show)])
+            self.log.emit(f" Primeros triggers: {pairs}")
 
         if self.output_gain != 1.0:
-            mix = np.clip(mix * float(self.output_gain), -1.0, 1.0).astype(np.float32)
+            y_rec = np.clip(y_rec * float(self.output_gain), -1.0, 1.0).astype(np.float32)
 
         out_dir = os.path.dirname(out_file)
         if out_dir and not os.path.isdir(out_dir):
             os.makedirs(out_dir, exist_ok=True)
-        sf.write(out_file, mix, sr)
+
+        sf.write(out_file, y_rec, sr)
         self.log.emit(f" Guardado: {out_file}")
 
     def run(self):
         try:
-            inp = self.input_path
-            outp = self.output_path
+            files = [f for f in self.input_files if os.path.isfile(f)]
+            if not files:
+                raise RuntimeError("No hay archivos de entrada válidos.")
 
-            wavetable_files = list_wav_files(self.wt_dir, recursive=True)
-            if len(wavetable_files) == 0:
-                raise RuntimeError("No se encontraron .wav en la carpeta de wavetables (incl. subcarpetas).")
+            outp = self.output_path.strip()
+            if not outp:
+                raise RuntimeError("Output vacío. Elige una carpeta o archivo de salida.")
 
-            # ✅ RNG: si seed=0 => azar total (entropy del sistema)
+            # si múltiples inputs: output debe ser carpeta o ruta sin extensión .wav
+            if len(files) > 1 and os.path.splitext(outp)[1].lower() == ".wav" and not os.path.isdir(outp):
+                raise RuntimeError("Para múltiples archivos de entrada, el Output debe ser una carpeta (no un .wav).")
+
             rng = np.random.default_rng(None if self.seed == 0 else self.seed)
 
-            is_batch = os.path.isdir(inp)
-            if not is_batch:
-                # SINGLE
-                if not os.path.isfile(inp):
-                    raise RuntimeError("Input single debe ser un archivo.")
-
-                # Si output es carpeta, guardamos ahí con nombre automático
-                if os.path.isdir(outp):
-                    base = os.path.splitext(os.path.basename(inp))[0]
-                    out_file = os.path.join(outp, base + "__restored.wav")
-                else:
-                    # si no tiene extensión, asumimos carpeta y la creamos
-                    if os.path.splitext(outp)[1].lower() != ".wav":
-                        os.makedirs(outp, exist_ok=True)
-                        base = os.path.splitext(os.path.basename(inp))[0]
-                        out_file = os.path.join(outp, base + "__restored.wav")
-                    else:
-                        out_file = outp
-
-                self.progress.emit(5)
-                self.log.emit("=== PROCESO SINGLE (WT-IMPULSE / OLA) ===")
-                self.log.emit(
-                    f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
-                )
-                self._process_one(inp, out_file, wavetable_files, rng)
-                self.progress.emit(100)
-                self.finished.emit()
-                return
-
-            # BATCH
-            in_dir = inp
-            out_dir = outp
-            if os.path.isfile(out_dir):
-                out_dir = os.path.dirname(out_dir)
-            if not out_dir:
-                raise RuntimeError("Output batch debe ser una carpeta válida.")
-            os.makedirs(out_dir, exist_ok=True)
-
-            files = list_audio_files(in_dir)
-            if not files:
-                raise RuntimeError("No se encontraron audios en la carpeta input.")
-
-            self.log.emit("=== PROCESO BATCH (WT-IMPULSE / OLA) ===")
-            self.log.emit(f"Input: {in_dir}")
-            self.log.emit(f"Output: {out_dir}")
-            self.log.emit(
-                f"Wavetable dir: {self.wt_dir} | count={len(wavetable_files)} | seed={'RANDOM' if self.seed==0 else self.seed}"
-            )
-
-            self.progress.emit(1)
             total = len(files)
-            for idx, src_file in enumerate(files):
-                base = os.path.splitext(os.path.basename(src_file))[0]
-                out_file = os.path.join(out_dir, base + "__restored.wav")
-                self.log.emit(f"\n[{idx+1}/{total}]")
-                p = int(5 + 90 * (idx / max(1, total)))
+            self.progress.emit(1)
+
+            for idx, f in enumerate(files):
+                self.log.emit("")
+                self.log.emit(f"[{idx+1}/{total}]")
+                out_file = self._resolve_outfile(f)
+                p = int(2 + 96 * (idx / max(1, total)))
                 self.progress.emit(p)
-                self._process_one(src_file, out_file, wavetable_files, rng)
+                self._process_one(f, out_file, rng)
 
             self.progress.emit(100)
             self.finished.emit()
-
         except Exception as e:
             self.error.emit(str(e))
 
@@ -820,8 +626,10 @@ class AudioWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Restaurador por Síntesis (WT Impulse/OLA + Timbre match) — Random REAL")
-        self.resize(980, 720)
+        self.setWindowTitle("Reconstrucción Percusiva por Eventos (HQ) — Batch / Multi-capas")
+        self.resize(1020, 760)
+
+        self.input_files: list[str] = []
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -829,25 +637,34 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(10)
 
-        # Input / Output (con botones separados archivo/carpeta)
-        self.in_edit = QLineEdit()
-        self.out_edit = QLineEdit()
+        # ---------- Input / Output ----------
+        gb_io = QGroupBox("Entrada / Salida")
+        io = QVBoxLayout(gb_io)
 
-        btn_in_file = QPushButton("Input archivo…")
+        self.in_edit = QLineEdit()
+        self.in_edit.setPlaceholderText("Selecciona archivo(s) o carpeta…")
+        self.out_edit = QLineEdit()
+        self.out_edit.setPlaceholderText("Selecciona carpeta de salida (recomendado) o archivo .wav (solo 1 input)…")
+
+        btn_in_files = QPushButton("Input archivo(s)…")
         btn_in_dir = QPushButton("Input carpeta…")
+        btn_clear = QPushButton("Limpiar lista")
+
         btn_out_file = QPushButton("Output archivo…")
         btn_out_dir = QPushButton("Output carpeta…")
 
-        btn_in_file.clicked.connect(self.pick_input_file)
+        btn_in_files.clicked.connect(self.pick_input_files)
         btn_in_dir.clicked.connect(self.pick_input_dir)
+        btn_clear.clicked.connect(self.clear_inputs)
         btn_out_file.clicked.connect(self.pick_output_file)
         btn_out_dir.clicked.connect(self.pick_output_dir)
 
         row_in = QHBoxLayout()
         row_in.addWidget(QLabel("Input:"))
         row_in.addWidget(self.in_edit, stretch=1)
-        row_in.addWidget(btn_in_file)
+        row_in.addWidget(btn_in_files)
         row_in.addWidget(btn_in_dir)
+        row_in.addWidget(btn_clear)
 
         row_out = QHBoxLayout()
         row_out.addWidget(QLabel("Output:"))
@@ -855,154 +672,108 @@ class MainWindow(QMainWindow):
         row_out.addWidget(btn_out_file)
         row_out.addWidget(btn_out_dir)
 
-        layout.addLayout(row_in)
-        layout.addLayout(row_out)
+        io.addLayout(row_in)
+        io.addLayout(row_out)
 
-        # Wavetables
-        gb_wt = QGroupBox("Wavetables (random desde carpeta)")
-        g = QVBoxLayout(gb_wt)
+        self.file_list = QListWidget()
+        self.file_list.setMinimumHeight(120)
+        io.addWidget(QLabel("Archivos en cola:"))
+        io.addWidget(self.file_list)
 
-        self.wt_dir_edit = QLineEdit(WT_DIR_DEFAULT)
-        btn_wt_dir = QPushButton("Carpeta…")
-        btn_wt_dir.clicked.connect(self.pick_wt_dir)
+        layout.addWidget(gb_io)
 
-        row_wtdir = QHBoxLayout()
-        row_wtdir.addWidget(QLabel("Carpeta wavetables:"))
-        row_wtdir.addWidget(self.wt_dir_edit, stretch=1)
-        row_wtdir.addWidget(btn_wt_dir)
-        g.addLayout(row_wtdir)
+        # ---------- Settings ----------
+        gb_set = QGroupBox("Parámetros (calidad / triggers / aire)")
+        s = QHBoxLayout(gb_set)
 
-        row_rand = QHBoxLayout()
+        # left column
+        col1 = QVBoxLayout()
+        col2 = QVBoxLayout()
+
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 2_000_000_000)
         self.seed_spin.setValue(0)
-
-        row_rand.addWidget(QLabel("Seed (0 = RANDOM SIEMPRE):"))
-        row_rand.addWidget(self.seed_spin)
-
-        self.pos_min = QDoubleSpinBox()
-        self.pos_min.setRange(0.0, 1.0)
-        self.pos_min.setSingleStep(0.01)
-        self.pos_min.setValue(0.0)
-
-        self.pos_max = QDoubleSpinBox()
-        self.pos_max.setRange(0.0, 1.0)
-        self.pos_max.setSingleStep(0.01)
-        self.pos_max.setValue(1.0)
-
-        self.mip_min = QDoubleSpinBox()
-        self.mip_min.setRange(0.0, 1.0)
-        self.mip_min.setSingleStep(0.05)
-        self.mip_min.setValue(0.6)
-
-        self.mip_max = QDoubleSpinBox()
-        self.mip_max.setRange(0.0, 1.0)
-        self.mip_max.setSingleStep(0.05)
-        self.mip_max.setValue(1.0)
-
-        row_rand.addSpacing(10)
-        row_rand.addWidget(QLabel("WT pos min:"))
-        row_rand.addWidget(self.pos_min)
-        row_rand.addWidget(QLabel("max:"))
-        row_rand.addWidget(self.pos_max)
-
-        row_rand.addSpacing(10)
-        row_rand.addWidget(QLabel("WT mip min:"))
-        row_rand.addWidget(self.mip_min)
-        row_rand.addWidget(QLabel("max:"))
-        row_rand.addWidget(self.mip_max)
-
-        row_rand.addStretch()
-        g.addLayout(row_rand)
-        layout.addWidget(gb_wt)
-
-        # Analysis
-        gb_an = QGroupBox("Análisis")
-        a = QHBoxLayout(gb_an)
 
         self.hop_spin = QSpinBox()
         self.hop_spin.setRange(64, 4096)
         self.hop_spin.setSingleStep(64)
         self.hop_spin.setValue(DEFAULT_HOP_LENGTH)
 
-        self.env_alpha = QDoubleSpinBox()
-        self.env_alpha.setRange(0.01, 1.0)
-        self.env_alpha.setSingleStep(0.05)
-        self.env_alpha.setValue(0.25)
+        self.flux_alpha = QDoubleSpinBox()
+        self.flux_alpha.setRange(0.01, 1.0)
+        self.flux_alpha.setSingleStep(0.05)
+        self.flux_alpha.setValue(0.25)
 
-        self.f0_alpha = QDoubleSpinBox()
-        self.f0_alpha.setRange(0.01, 1.0)
-        self.f0_alpha.setSingleStep(0.05)
-        self.f0_alpha.setValue(0.20)
+        self.trig_thresh = QDoubleSpinBox()
+        self.trig_thresh.setRange(0.0, 1.0)
+        self.trig_thresh.setSingleStep(0.05)
+        self.trig_thresh.setValue(0.35)
 
-        self.gate_check = QCheckBox("Mutear unvoiced")
-        self.gate_check.setChecked(True)
+        self.min_dist_ms = QDoubleSpinBox()
+        self.min_dist_ms.setRange(5.0, 250.0)
+        self.min_dist_ms.setSingleStep(5.0)
+        self.min_dist_ms.setValue(35.0)
+
+        self.attack_frames = QSpinBox()
+        self.attack_frames.setRange(1, 10)
+        self.attack_frames.setValue(3)
+
+        self.env_smooth_bins = QSpinBox()
+        self.env_smooth_bins.setRange(1, 256)
+        self.env_smooth_bins.setValue(31)
+
+        self.only_hits = QCheckBox("Solo hits (sin bed)")
+        self.only_hits.setChecked(True)
+
+        self.air_amount = QDoubleSpinBox()
+        self.air_amount.setRange(0.0, 2.0)
+        self.air_amount.setSingleStep(0.1)
+        self.air_amount.setValue(1.0)
 
         self.gain_spin = QDoubleSpinBox()
         self.gain_spin.setRange(0.1, 3.0)
         self.gain_spin.setSingleStep(0.1)
         self.gain_spin.setValue(1.0)
 
-        a.addWidget(QLabel("Hop:"))
-        a.addWidget(self.hop_spin)
-        a.addSpacing(10)
-        a.addWidget(QLabel("Env α:"))
-        a.addWidget(self.env_alpha)
-        a.addSpacing(10)
-        a.addWidget(QLabel("F0 α:"))
-        a.addWidget(self.f0_alpha)
-        a.addSpacing(12)
-        a.addWidget(self.gate_check)
-        a.addSpacing(10)
-        a.addWidget(QLabel("Gain:"))
-        a.addWidget(self.gain_spin)
-        a.addStretch()
+        col1.addWidget(QLabel("Seed (0 = RANDOM):"))
+        col1.addWidget(self.seed_spin)
+        col1.addSpacing(6)
+        col1.addWidget(QLabel("Hop (samples):"))
+        col1.addWidget(self.hop_spin)
+        col1.addSpacing(6)
+        col1.addWidget(QLabel("Flux smooth α:"))
+        col1.addWidget(self.flux_alpha)
+        col1.addSpacing(6)
+        col1.addWidget(QLabel("Trigger thresh (rel):"))
+        col1.addWidget(self.trig_thresh)
+        col1.addStretch()
 
-        layout.addWidget(gb_an)
+        col2.addWidget(QLabel("Min dist (ms):"))
+        col2.addWidget(self.min_dist_ms)
+        col2.addSpacing(6)
+        col2.addWidget(QLabel("Attack frames:"))
+        col2.addWidget(self.attack_frames)
+        col2.addSpacing(6)
+        col2.addWidget(QLabel("Env smooth bins:"))
+        col2.addWidget(self.env_smooth_bins)
+        col2.addSpacing(6)
+        col2.addWidget(self.only_hits)
+        col2.addSpacing(6)
+        col2.addWidget(QLabel("Air amount:"))
+        col2.addWidget(self.air_amount)
+        col2.addSpacing(6)
+        col2.addWidget(QLabel("Output gain:"))
+        col2.addWidget(self.gain_spin)
+        col2.addStretch()
 
-        # Spectral match
-        gb_sm = QGroupBox("Spectral envelope match (timbre / EQ dinámica)")
-        s = QHBoxLayout(gb_sm)
-
-        self.spec_enable = QCheckBox("Activar")
-        self.spec_enable.setChecked(True)
-
-        self.spec_strength = QDoubleSpinBox()
-        self.spec_strength.setRange(0.0, 1.0)
-        self.spec_strength.setSingleStep(0.05)
-        self.spec_strength.setValue(0.7)
-
-        self.spec_smooth_bins = QSpinBox()
-        self.spec_smooth_bins.setRange(1, 256)
-        self.spec_smooth_bins.setValue(25)
-
-        self.spec_clamp_lo = QDoubleSpinBox()
-        self.spec_clamp_lo.setRange(0.01, 1.0)
-        self.spec_clamp_lo.setSingleStep(0.05)
-        self.spec_clamp_lo.setValue(0.25)
-
-        self.spec_clamp_hi = QDoubleSpinBox()
-        self.spec_clamp_hi.setRange(1.0, 20.0)
-        self.spec_clamp_hi.setSingleStep(0.5)
-        self.spec_clamp_hi.setValue(4.0)
-
-        s.addWidget(self.spec_enable)
-        s.addSpacing(10)
-        s.addWidget(QLabel("Strength:"))
-        s.addWidget(self.spec_strength)
-        s.addSpacing(10)
-        s.addWidget(QLabel("Smooth bins:"))
-        s.addWidget(self.spec_smooth_bins)
-        s.addSpacing(10)
-        s.addWidget(QLabel("Clamp lo:"))
-        s.addWidget(self.spec_clamp_lo)
-        s.addWidget(QLabel("hi:"))
-        s.addWidget(self.spec_clamp_hi)
+        s.addLayout(col1)
+        s.addSpacing(20)
+        s.addLayout(col2)
         s.addStretch()
 
-        layout.addWidget(gb_sm)
+        layout.addWidget(gb_set)
 
-        # Process
+        # ---------- Process ----------
         self.btn_process = QPushButton("Procesar")
         self.btn_process.clicked.connect(self.start_processing)
         layout.addWidget(self.btn_process)
@@ -1017,8 +788,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.logs, stretch=1)
 
         layout.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Expanding))
-
-        footer = QLabel("© 2025 Gabriel Golker")
+        footer = QLabel("© 2025 Gabriel Golker — Reconstrucción por Eventos (HQ)")
         footer.setAlignment(Qt.AlignCenter)
         layout.addWidget(footer)
 
@@ -1028,27 +798,54 @@ class MainWindow(QMainWindow):
     def log(self, msg: str):
         self.logs.append(msg)
 
+    def refresh_file_list(self):
+        self.file_list.clear()
+        for f in self.input_files:
+            it = QListWidgetItem(f)
+            self.file_list.addItem(it)
+        if len(self.input_files) == 0:
+            self.in_edit.setText("")
+        elif len(self.input_files) == 1:
+            self.in_edit.setText(self.input_files[0])
+        else:
+            self.in_edit.setText(f"{self.input_files[0]}  (+{len(self.input_files)-1} más)")
+
+    def clear_inputs(self):
+        self.input_files = []
+        self.refresh_file_list()
+
     # --------- pickers ---------
-    def pick_input_file(self):
-        path, _ = QFileDialog.getOpenFileName(
+    def pick_input_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Seleccionar audio fuente",
+            "Seleccionar capa(s)/audio(s)",
             "",
             "Audio files (*.wav *.flac *.ogg *.mp3 *.aiff *.m4a);;Todos (*.*)",
         )
-        if path:
-            self.in_edit.setText(path)
+        if paths:
+            # evita duplicados, mantiene orden
+            s = set(self.input_files)
+            for p in paths:
+                if p not in s:
+                    self.input_files.append(p)
+                    s.add(p)
+            self.refresh_file_list()
 
     def pick_input_dir(self):
         folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta input")
         if folder:
-            self.in_edit.setText(folder)
+            files = list_audio_files(folder)
+            if not files:
+                QMessageBox.warning(self, "Input", "No se encontraron audios en la carpeta.")
+                return
+            self.input_files = files
+            self.refresh_file_list()
 
     def pick_output_file(self):
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Guardar salida",
-            "resultado__restored.wav",
+            "Guardar salida (solo recomendado si hay 1 input)",
+            "resultado__recon.wav",
             "WAV (*.wav);;Todos (*.*)",
         )
         if path:
@@ -1059,60 +856,46 @@ class MainWindow(QMainWindow):
         if folder:
             self.out_edit.setText(folder)
 
-    def pick_wt_dir(self):
-        start = self.wt_dir_edit.text().strip() or WT_DIR_DEFAULT
-        folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta de wavetables", start)
-        if folder:
-            self.wt_dir_edit.setText(folder)
-
     # --------- run ---------
     def start_processing(self):
-        inp = self.in_edit.text().strip()
         outp = self.out_edit.text().strip()
-        wt_dir = self.wt_dir_edit.text().strip()
 
-        if not inp or not outp:
-            QMessageBox.warning(self, "Falta info", "Completa input y output.")
+        if not self.input_files:
+            QMessageBox.warning(self, "Falta info", "Selecciona al menos 1 archivo o una carpeta de entrada.")
             return
-        if not wt_dir or not os.path.isdir(wt_dir):
-            QMessageBox.warning(self, "Wavetables", "La carpeta de wavetables no existe.")
+        if not outp:
+            QMessageBox.warning(self, "Falta info", "Selecciona Output (carpeta recomendado).")
             return
 
-        pos_min = float(self.pos_min.value())
-        pos_max = float(self.pos_max.value())
-        if pos_min > pos_max:
-            pos_min, pos_max = pos_max, pos_min
-
-        mip_min = float(self.mip_min.value())
-        mip_max = float(self.mip_max.value())
-        if mip_min > mip_max:
-            mip_min, mip_max = mip_max, mip_min
+        # quick validation
+        bad = [f for f in self.input_files if not os.path.isfile(f)]
+        if bad:
+            QMessageBox.warning(self, "Input", "Hay rutas inválidas en la lista.")
+            return
 
         self.logs.clear()
         self.progress.setValue(0)
         self.btn_process.setEnabled(False)
+        self.log("=== RECONSTRUCCIÓN POR EVENTOS (HQ) ===")
+        self.log(f"Inputs: {len(self.input_files)} archivo(s)")
+        self.log(f"Output: {outp}")
+        self.log(f"Seed: {'RANDOM' if self.seed_spin.value()==0 else self.seed_spin.value()}")
 
         self.thread = QThread()
         self.worker = AudioWorker(
-            input_path=inp,
+            input_files=self.input_files,
             output_path=outp,
-            wt_dir=wt_dir,
             seed=int(self.seed_spin.value()),
-            pos_min=pos_min,
-            pos_max=pos_max,
-            mip_min=mip_min,
-            mip_max=mip_max,
             hop_length=int(self.hop_spin.value()),
             frame_length=DEFAULT_FRAME_LENGTH,
-            env_alpha=float(self.env_alpha.value()),
-            f0_alpha=float(self.f0_alpha.value()),
-            gate_unvoiced=bool(self.gate_check.isChecked()),
+            flux_alpha=float(self.flux_alpha.value()),
+            trig_thresh=float(self.trig_thresh.value()),
+            min_dist_ms=float(self.min_dist_ms.value()),
+            attack_frames=int(self.attack_frames.value()),
+            env_smooth_bins=int(self.env_smooth_bins.value()),
+            only_hits=bool(self.only_hits.isChecked()),
+            air_amount=float(self.air_amount.value()),
             output_gain=float(self.gain_spin.value()),
-            enable_spec_match=bool(self.spec_enable.isChecked()),
-            spec_strength=float(self.spec_strength.value()),
-            spec_smooth_bins=int(self.spec_smooth_bins.value()),
-            spec_clamp_lo=float(self.spec_clamp_lo.value()),
-            spec_clamp_hi=float(self.spec_clamp_hi.value()),
         )
 
         self.worker.moveToThread(self.thread)
@@ -1150,3 +933,4 @@ if __name__ == "__main__":
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
+
