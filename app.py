@@ -2,8 +2,11 @@ import sys
 import os
 import glob
 import json
+import math
 import numpy as np
 import soundfile as sf
+
+from scipy.signal import resample_poly
 
 from librosa.core.audio import load as lr_load
 from librosa.core.spectrum import stft as lr_stft, istft as lr_istft
@@ -39,14 +42,18 @@ AUDIO_EXTS = (".wav", ".flac", ".ogg", ".mp3", ".aiff", ".aif", ".m4a")
 
 INDEX_FILENAME = "wt_index.npz"
 INDEX_FEAT_DIM = 64
-INDEX_FRAME_SIZE = 2048  # normalizamos todos los frames a 2048 para comparar
+INDEX_FRAME_SIZE = 2048
 INDEX_SMOOTH_BINS = 9
+
+# Target quality
+TARGET_SR = 96000
+OUTPUT_SUBTYPE = "PCM_24"  # 24-bit WAV
 
 # Hit analysis defaults
 DEFAULT_MIN_DIST_MS = 20
 DEFAULT_THRESH = 0.25
 DEFAULT_BODY_START_MS = 10
-DEFAULT_BODY_DUR_MS = 40
+DEFAULT_BODY_DUR_MS = 45
 
 # Synthesis defaults
 DEFAULT_MAX_HIT_MS = 250
@@ -54,6 +61,19 @@ DEFAULT_ATTACK_MS = 2
 DEFAULT_AIR_HPF = 8000.0
 DEFAULT_CLICK_HPF = 3000.0
 DEFAULT_VEL_GAMMA = 1.15
+
+# Pitch defaults
+DEFAULT_PITCH_ENABLE = True
+DEFAULT_PITCH_FMIN = 40.0
+DEFAULT_PITCH_FMAX = 900.0
+DEFAULT_TONALITY_THR = 0.25     # más alto => más estricto
+DEFAULT_PITCH_ENV_SEMI = 12.0   # caída inicial (semitonos, positivo = más alto al inicio)
+DEFAULT_PITCH_ENV_MS = 15.0
+DEFAULT_PITCH_ENV_STRENGTH = 0.8
+
+# Multi-candidate defaults
+DEFAULT_MIX_N = 3
+DEFAULT_MIX_TEMP = 0.08  # más bajo => más “elige el mejor”; más alto => mezcla más
 
 
 # ----------------- UTILS -----------------
@@ -92,6 +112,40 @@ def _linear_resample(x: np.ndarray, new_len: int) -> np.ndarray:
 def load_mono(path: str):
     y, sr = lr_load(path, sr=None, mono=True)
     return y.astype(np.float32, copy=False), int(sr)
+
+
+def peak_amp(x: np.ndarray) -> float:
+    return float(np.max(np.abs(np.asarray(x, dtype=np.float32))) + 1e-12)
+
+
+def peak_dbfs(x: np.ndarray) -> float:
+    p = peak_amp(x)
+    return float(20.0 * np.log10(p))
+
+
+def match_peak_to_reference(y: np.ndarray, ref_peak_amp: float) -> np.ndarray:
+    y = np.asarray(y, dtype=np.float32)
+    p = float(np.max(np.abs(y)) + 1e-12)
+    if ref_peak_amp <= 1e-9:
+        return y
+    g = float(ref_peak_amp / p)
+    yy = y * g
+    # clamp safety
+    m = float(np.max(np.abs(yy)) + 1e-12)
+    if m > 0.999:
+        yy = yy * (0.999 / m)
+    return yy.astype(np.float32, copy=False)
+
+
+def resample_to_target(y: np.ndarray, sr_in: int, sr_target: int) -> np.ndarray:
+    if sr_in == sr_target:
+        return y.astype(np.float32, copy=False)
+    # resample_poly with rational approximation: up/down by gcd
+    g = math.gcd(sr_in, sr_target)
+    up = sr_target // g
+    down = sr_in // g
+    y_rs = resample_poly(y.astype(np.float32), up=up, down=down).astype(np.float32, copy=False)
+    return y_rs
 
 
 def one_pole_smooth(x: np.ndarray, alpha: float) -> np.ndarray:
@@ -142,11 +196,9 @@ def list_audio_files(folder: str):
 
 
 def infer_wavetable_frame_size(n_samples: int) -> int:
-    # Serum/Vital comúnmente exportan 2048 (o 4096). Preferimos 2048 si cuadra bien.
     for fs in (2048, 4096, 1024):
         if n_samples >= fs * 4 and (n_samples % fs) == 0:
             return fs
-    # fallback: elige el más cercano que dé al menos 1 frame
     return 2048
 
 
@@ -154,7 +206,7 @@ def infer_wavetable_frame_size(n_samples: int) -> int:
 def smooth_1d(x: np.ndarray, k: int) -> np.ndarray:
     k = int(max(1, k))
     if k <= 1:
-        return x
+        return x.astype(np.float32, copy=False)
     ker = np.ones(k, dtype=np.float32) / float(k)
     pad = k // 2
     xp = np.pad(x.astype(np.float32), (pad, pad), mode="reflect")
@@ -165,7 +217,6 @@ def downsample_bins(x: np.ndarray, n: int) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     if len(x) == n:
         return x
-    # promedio por grupos (más estable que interpolar)
     idx = np.linspace(0, len(x), n + 1, dtype=np.int32)
     out = np.zeros(n, dtype=np.float32)
     for i in range(n):
@@ -182,20 +233,17 @@ def frame_to_feature(frame_2048: np.ndarray, feat_dim: int = INDEX_FEAT_DIM, smo
     x = _fade_edges(x, fade=16)
     x = _normalize_frame(x)
 
-    # FFT
     win = np.hanning(len(x)).astype(np.float32)
     X = np.fft.rfft(x * win)
     mag = (np.abs(X) + 1e-8).astype(np.float32)
     logmag = np.log(mag).astype(np.float32)
 
-    # drop DC a veces ayuda
     if len(logmag) > 2:
         logmag = logmag[1:]
 
     logmag = smooth_1d(logmag, smooth_bins)
     feat = downsample_bins(logmag, feat_dim)
 
-    # normalize L2 (cosine-friendly)
     nrm = float(np.linalg.norm(feat) + 1e-12)
     feat = (feat / nrm).astype(np.float32, copy=False)
     return feat
@@ -257,7 +305,6 @@ def build_wt_index(wt_folder: str, index_path: str, log_cb=None) -> dict:
             frame_ids.append(fr)
 
     features = np.asarray(features, dtype=np.float32)
-    # pre-normalized already, but re-normalize in case
     fn = np.linalg.norm(features, axis=1, keepdims=True) + 1e-12
     features = (features / fn).astype(np.float32)
 
@@ -267,7 +314,6 @@ def build_wt_index(wt_folder: str, index_path: str, log_cb=None) -> dict:
     file_n_frames = np.asarray(file_n_frames, dtype=np.int32)
     paths_arr = np.asarray(paths, dtype=object)
 
-    # store as float16 for disk/mem (loads fast, cast to float32 when needed)
     np.savez_compressed(
         index_path,
         features=features.astype(np.float16),
@@ -295,7 +341,6 @@ def build_wt_index(wt_folder: str, index_path: str, log_cb=None) -> dict:
 def load_wt_index(index_path: str) -> dict:
     z = np.load(index_path, allow_pickle=True)
     features = z["features"].astype(np.float32)
-    # ensure L2 norm
     features = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-12)
 
     return {
@@ -313,17 +358,37 @@ def match_best_frames(query_feat: np.ndarray, index: dict, topk: int = 8):
     q = np.asarray(query_feat, dtype=np.float32)
     q = q / (np.linalg.norm(q) + 1e-12)
     sims = feats @ q  # cosine similarity
-    if topk <= 1:
-        i = int(np.argmax(sims))
-        return [i], [float(sims[i])]
-    k = int(min(topk, len(sims)))
-    # partial argpartition
+    k = int(min(max(1, topk), len(sims)))
     idx = np.argpartition(-sims, k - 1)[:k]
     idx = idx[np.argsort(-sims[idx])]
     return idx.tolist(), [float(sims[i]) for i in idx.tolist()]
 
 
+def softmax_w(x: np.ndarray, temp: float) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    t = float(max(1e-5, temp))
+    z = x / t
+    z = z - float(np.max(z))
+    e = np.exp(z).astype(np.float32)
+    s = float(np.sum(e) + 1e-12)
+    return (e / s).astype(np.float32, copy=False)
+
+
 # ----------------- HIT DETECTION & ANALYSIS -----------------
+def smooth_freq_logmag(logmag: np.ndarray, smooth_bins: int) -> np.ndarray:
+    smooth_bins = int(max(1, smooth_bins))
+    if smooth_bins <= 1:
+        return logmag
+    k = smooth_bins
+    kernel = np.ones(k, dtype=np.float32) / float(k)
+    pad = k // 2
+    padded = np.pad(logmag, ((pad, pad), (0, 0)), mode="reflect")
+    out = np.empty_like(logmag, dtype=np.float32)
+    for t in range(logmag.shape[1]):
+        out[:, t] = np.convolve(padded[:, t], kernel, mode="valid").astype(np.float32)
+    return out
+
+
 def compute_logmag(y: np.ndarray, frame_length: int, hop_length: int):
     S = lr_stft(
         y.astype(np.float32),
@@ -350,7 +415,6 @@ def pick_triggers(flux: np.ndarray, thresh: float, min_dist_frames: int) -> np.n
     x = np.asarray(flux, dtype=np.float32)
     thr = float(np.clip(thresh, 0.0, 1.0))
 
-    # adaptive help: si todo es bajo, baja un poco
     p90 = float(np.percentile(x, 90))
     if p90 < thr:
         thr = max(0.08, p90 * 0.85)
@@ -399,47 +463,135 @@ def extract_multiband_env_and_specenv(y: np.ndarray, sr: int, frame_length: int,
         env = env / (np.max(env) + 1e-12)
         env_bands[bi] = env
 
-    # spec envelope
     spec_env_log = smooth_freq_logmag(logmag, smooth_bins=spec_smooth_bins)
     spec_env = np.exp(spec_env_log).astype(np.float32)
 
-    # smooth env bands
     for bi in range(4):
         env_bands[bi] = one_pole_smooth(env_bands[bi], alpha=env_smooth_alpha)
 
     return env_bands, spec_env, mag, logmag
 
 
-def smooth_freq_logmag(logmag: np.ndarray, smooth_bins: int) -> np.ndarray:
-    smooth_bins = int(max(1, smooth_bins))
-    if smooth_bins <= 1:
-        return logmag
-    k = smooth_bins
-    kernel = np.ones(k, dtype=np.float32) / float(k)
-    pad = k // 2
-    padded = np.pad(logmag, ((pad, pad), (0, 0)), mode="reflect")
-    out = np.empty_like(logmag, dtype=np.float32)
-    for t in range(logmag.shape[1]):
-        out[:, t] = np.convolve(padded[:, t], kernel, mode="valid").astype(np.float32)
-    return out
+# ----------------- Pitch estimation per hit (autocorr, + tonal gate) -----------------
+def estimate_f0_autocorr(y_seg: np.ndarray, sr: int, fmin: float, fmax: float) -> tuple[float, float]:
+    """
+    Returns (f0_hz, harmonicity) where harmonicity is 0..1-ish (higher = more tonal).
+    """
+    x = np.asarray(y_seg, dtype=np.float32)
+    if len(x) < 64:
+        return 0.0, 0.0
+
+    # prefilter: remove DC, gentle HP to reduce rumble
+    x = x - float(np.mean(x))
+    x = one_pole_hpf(x, sr, 25.0)
+    # window
+    w = np.hanning(len(x)).astype(np.float32)
+    xw = x * w
+
+    # autocorr via FFT
+    n = int(1 << (len(xw) - 1).bit_length())
+    X = np.fft.rfft(xw, n=n)
+    ac = np.fft.irfft(X * np.conj(X), n=n).astype(np.float32)
+    ac = ac[: len(xw)]
+    ac0 = float(ac[0] + 1e-12)
+
+    # lag range
+    fmin = float(np.clip(fmin, 20.0, sr * 0.45))
+    fmax = float(np.clip(fmax, fmin + 10.0, sr * 0.45))
+    lag_min = int(max(1, sr / fmax))
+    lag_max = int(min(len(ac) - 1, sr / fmin))
+    if lag_max <= lag_min + 2:
+        return 0.0, 0.0
+
+    seg = ac[lag_min:lag_max]
+    i_rel = int(np.argmax(seg))
+    i = lag_min + i_rel
+
+    # parabolic refine
+    if 1 <= i < len(ac) - 1:
+        y0, y1, y2 = float(ac[i - 1]), float(ac[i]), float(ac[i + 1])
+        denom = (y0 - 2.0 * y1 + y2)
+        if abs(denom) > 1e-9:
+            delta = 0.5 * (y0 - y2) / denom
+            i_f = float(i) + float(np.clip(delta, -0.5, 0.5))
+        else:
+            i_f = float(i)
+    else:
+        i_f = float(i)
+
+    peak = float(ac[i] / ac0)
+    f0 = float(sr / max(1e-6, i_f))
+
+    # harmonicity measure: peak normalized energy
+    harm = float(np.clip(peak, 0.0, 1.0))
+    if not np.isfinite(f0):
+        return 0.0, 0.0
+    return f0, harm
+
+
+def pitch_envelope_freq(
+    f0: float,
+    sr: int,
+    n: int,
+    semi: float,
+    env_ms: float,
+    strength: float,
+) -> np.ndarray:
+    f0 = float(max(1.0, f0))
+    strength = float(np.clip(strength, 0.0, 1.0))
+    if strength <= 1e-6 or env_ms <= 0.1:
+        return np.full(n, f0, dtype=np.float32)
+
+    ratio0 = float(2.0 ** (semi / 12.0))
+    # exponential decay of ratio to 1.0 over env_ms
+    tau = float(max(1e-4, (env_ms / 1000.0) / 4.0))
+    t = (np.arange(n, dtype=np.float32) / float(sr)).astype(np.float32)
+    ratio = 1.0 + (ratio0 - 1.0) * np.exp(-t / tau).astype(np.float32)
+
+    f_env = (f0 * ratio).astype(np.float32)
+    # strength blend
+    return ((1.0 - strength) * f0 + strength * f_env).astype(np.float32, copy=False)
 
 
 # ----------------- SYNTH (wavetable osc per hit) -----------------
-def load_wavetable_frame_by_index(path: str, frame_idx: int, frame_size: int) -> np.ndarray:
-    audio, _sr = sf.read(path, always_2d=False)
-    audio = _to_mono_float(audio)
-    if len(audio) < frame_size:
-        audio = np.pad(audio, (0, frame_size - len(audio)))
-    n_frames = max(1, len(audio) // frame_size)
-    frame_idx = int(np.clip(frame_idx, 0, n_frames - 1))
-    start = frame_idx * frame_size
-    fr = audio[start : start + frame_size].astype(np.float32, copy=False)
-    fr = fr - float(np.mean(fr))
-    fr = _fade_edges(fr, fade=16)
-    fr = _normalize_frame(fr)
-    if frame_size != INDEX_FRAME_SIZE:
-        fr = _linear_resample(fr, INDEX_FRAME_SIZE)
-    return fr.astype(np.float32, copy=False)
+class WavetableCache:
+    def __init__(self):
+        self._audio = {}       # path -> mono float audio
+        self._framesize = {}   # path -> frame_size
+        self._nframes = {}     # path -> n_frames
+
+    def _load(self, path: str):
+        if path in self._audio:
+            return
+        audio, _sr = sf.read(path, always_2d=False)
+        audio = _to_mono_float(audio)
+        fs = infer_wavetable_frame_size(len(audio))
+        if len(audio) < fs:
+            audio = np.pad(audio, (0, fs - len(audio)))
+        n_frames = max(1, len(audio) // fs)
+        audio = audio[: n_frames * fs]
+        self._audio[path] = audio.astype(np.float32, copy=False)
+        self._framesize[path] = int(fs)
+        self._nframes[path] = int(n_frames)
+
+    def get_frame_2048(self, path: str, frame_idx: int) -> np.ndarray:
+        self._load(path)
+        audio = self._audio[path]
+        fs = self._framesize[path]
+        nfr = self._nframes[path]
+        frame_idx = int(np.clip(frame_idx, 0, nfr - 1))
+        start = frame_idx * fs
+        fr = audio[start : start + fs].astype(np.float32, copy=False)
+        fr = fr - float(np.mean(fr))
+        fr = _fade_edges(fr, fade=16)
+        fr = _normalize_frame(fr)
+        if fs != INDEX_FRAME_SIZE:
+            fr = _linear_resample(fr, INDEX_FRAME_SIZE)
+        return fr.astype(np.float32, copy=False)
+
+    def get_nframes(self, path: str) -> int:
+        self._load(path)
+        return int(self._nframes[path])
 
 
 def table_read_linear(table_1d: np.ndarray, phase: np.ndarray) -> np.ndarray:
@@ -451,12 +603,18 @@ def table_read_linear(table_1d: np.ndarray, phase: np.ndarray) -> np.ndarray:
     return (1.0 - frac) * table_1d[i0] + frac * table_1d[i1]
 
 
-def render_wavetable_osc_fixed(table: np.ndarray, f_hz: float, sr: int, n: int, phase0: float = 0.0):
-    f_hz = float(np.clip(f_hz, 1.0, sr * 0.45))
-    phase = (phase0 + (np.arange(n, dtype=np.float32) * (f_hz / float(sr)))) % 1.0
+def render_wavetable_osc_varfreq(table: np.ndarray, f_inst: np.ndarray, sr: int, phase0: float = 0.0):
+    f_inst = np.asarray(f_inst, dtype=np.float32)
+    n = len(f_inst)
+    phase = np.empty(n, dtype=np.float32)
+    ph = float(phase0 % 1.0)
+    inv_sr = 1.0 / float(sr)
+    for i in range(n):
+        phase[i] = ph
+        ph += float(np.clip(f_inst[i], 1.0, sr * 0.45)) * inv_sr
+        ph -= math.floor(ph)
     y = table_read_linear(table, phase).astype(np.float32, copy=False)
-    ph_end = float((phase0 + (n * (f_hz / float(sr)))) % 1.0)
-    return y, ph_end
+    return y, float(ph)
 
 
 def exp_env(n: int, sr: int, attack_ms: float, dur_ms: float, curve: float = 1.0):
@@ -465,15 +623,12 @@ def exp_env(n: int, sr: int, attack_ms: float, dur_ms: float, curve: float = 1.0
     dur = min(dur, n)
     env = np.zeros(n, dtype=np.float32)
 
-    # attack ramp
     a = np.linspace(0.0, 1.0, attack, dtype=np.float32)
     env[:attack] = a
 
-    # decay exp
     remain = dur - attack
     if remain > 0:
         t = np.linspace(0.0, 1.0, remain, dtype=np.float32)
-        # exp( -k t ) with k chosen
         k = 6.0
         d = np.exp(-k * t).astype(np.float32)
         env[attack:dur] = d
@@ -484,7 +639,43 @@ def exp_env(n: int, sr: int, attack_ms: float, dur_ms: float, curve: float = 1.0
     return env
 
 
-def synth_layer_wt_hits(
+def blend_tables_multi_candidate(
+    wt_index: dict,
+    cache: WavetableCache,
+    idxs: list[int],
+    sims: list[float],
+    mix_n: int,
+    mix_temp: float,
+    pos_state: float,
+    rng: np.random.Generator,
+):
+    n = int(min(max(1, mix_n), len(idxs)))
+    use_idxs = idxs[:n]
+    use_sims = np.asarray(sims[:n], dtype=np.float32)
+
+    w = softmax_w(use_sims, temp=mix_temp)
+    # tiny humanize in weights
+    w = w * (0.90 + 0.20 * rng.random(n)).astype(np.float32)
+    w = w / (float(np.sum(w)) + 1e-12)
+
+    table_mix = np.zeros(INDEX_FRAME_SIZE, dtype=np.float32)
+
+    for wi, global_idx in zip(w.tolist(), use_idxs):
+        fid = int(wt_index["file_ids"][global_idx])
+        wt_path = wt_index["paths"][fid]
+        nfr = int(wt_index["file_n_frames"][fid])
+
+        choose_idx = int(round(pos_state * (nfr - 1))) if nfr > 1 else 0
+        tab = cache.get_frame_2048(wt_path, choose_idx)
+        table_mix += float(wi) * tab
+
+    table_mix = table_mix - float(np.mean(table_mix))
+    table_mix = _fade_edges(table_mix, fade=16)
+    table_mix = _normalize_frame(table_mix)
+    return table_mix.astype(np.float32, copy=False)
+
+
+def synth_wt_hits_recon(
     y_src: np.ndarray,
     sr: int,
     triggers_frames: np.ndarray,
@@ -495,28 +686,33 @@ def synth_layer_wt_hits(
     frame_length: int,
     wt_index: dict,
     match_topk: int,
-    min_pos_walk: float,
-    max_pos_walk: float,
-    mip_min: float,
-    mip_max: float,
+    mix_n: int,
+    mix_temp: float,
     pos_min: float,
     pos_max: float,
+    pos_walk_min: float,
+    pos_walk_max: float,
     body_start_ms: float,
     body_dur_ms: float,
     max_hit_ms: float,
     attack_ms: float,
     only_hits: bool,
+    # pitch
+    pitch_enable: bool,
+    pitch_fmin: float,
+    pitch_fmax: float,
+    tonality_thr: float,
+    pitch_env_semi: float,
+    pitch_env_ms: float,
+    pitch_env_strength: float,
     rng: np.random.Generator,
     log_cb=None,
 ):
     n_samples = len(y_src)
     out = np.zeros(n_samples, dtype=np.float32)
 
-    # position walk state (0..1)
+    cache = WavetableCache()
     pos_state = float(np.clip(rng.uniform(pos_min, pos_max), 0.0, 1.0))
-
-    # micro-humanize OFF by default (timing exact). Puedes activarlo después si quieres.
-    micro_jitter_samples = 0
 
     body_start = int((body_start_ms / 1000.0) * sr)
     body_len = int((body_dur_ms / 1000.0) * sr)
@@ -524,69 +720,91 @@ def synth_layer_wt_hits(
 
     for k, fr in enumerate(triggers_frames.tolist()):
         t_center = int(fr * hop_length + frame_length // 2)
-        t0 = int(np.clip(t_center + micro_jitter_samples, 0, n_samples - 1))
+        t0 = int(np.clip(t_center, 0, n_samples - 1))
 
         vel = float(np.clip(flux[fr], 0.0, 1.0)) ** DEFAULT_VEL_GAMMA
-        vel *= float(0.9 + 0.2 * rng.random())  # tiny human velocity
+        vel *= float(0.9 + 0.2 * rng.random())
 
-        # tonal/noise hint
         cn = float(np.clip(centroid_norm[fr], 0.0, 1.0))
 
-        # body segment for matching
         seg_start = int(np.clip(t0 + body_start, 0, n_samples - 1))
         seg_end = int(np.clip(seg_start + body_len, seg_start + 1, n_samples))
         seg = y_src[seg_start:seg_end]
 
         qfeat = segment_to_feature(seg, feat_dim=INDEX_FEAT_DIM)
         idxs, sims = match_best_frames(qfeat, wt_index, topk=match_topk)
-        best = idxs[0]
-        fid = int(wt_index["file_ids"][best])
-        fidx = int(wt_index["frame_ids"][best])
-        wt_path = wt_index["paths"][fid]
-        wt_fs = int(wt_index["file_frame_size"][fid])
 
-        # position "walk" alrededor del ganador
-        nfr = int(wt_index["file_n_frames"][fid])
-        pos_target = 0.0 if nfr <= 1 else float(fidx) / float(max(1, nfr - 1))
-        walk_std = float(np.interp(cn, [0.0, 1.0], [min_pos_walk, max_pos_walk]))
+        # pos walk based on best match frame position
+        best = idxs[0]
+        fid_best = int(wt_index["file_ids"][best])
+        fidx_best = int(wt_index["frame_ids"][best])
+        nfr_best = int(wt_index["file_n_frames"][fid_best])
+        pos_target = 0.0 if nfr_best <= 1 else float(fidx_best) / float(max(1, nfr_best - 1))
+        walk_std = float(np.interp(cn, [0.0, 1.0], [pos_walk_min, pos_walk_max]))
         pos_state = float(np.clip(0.85 * pos_state + 0.15 * pos_target + rng.normal(0.0, walk_std), pos_min, pos_max))
 
-        # choose frame from pos_state
-        choose_idx = int(round(pos_state * (nfr - 1))) if nfr > 1 else 0
-        table = load_wavetable_frame_by_index(wt_path, choose_idx, wt_fs)
+        # multi-candidate blended table
+        table = blend_tables_multi_candidate(
+            wt_index=wt_index,
+            cache=cache,
+            idxs=idxs,
+            sims=sims,
+            mix_n=mix_n,
+            mix_temp=mix_temp,
+            pos_state=pos_state,
+            rng=rng,
+        )
 
-        # pick frequency: for drums, map centroid to useful base.
-        # (Esto da coherencia sin tener que detectar pitch perfecto)
-        f_base = float(np.interp(cn, [0.0, 1.0], [55.0, 220.0]))
-        # small pitch drop on hit
-        f0 = f_base * float(1.0 - 0.18 * vel)
-
-        # hit duration: low centroid -> longer, high centroid -> shorter
+        # duration
         dur_ms = float(np.interp(cn, [0.0, 1.0], [max_hit_ms, max(25.0, 0.25 * max_hit_ms)]))
-        n_hit = int(min(max_len, max(64, (dur_ms / 1000.0) * sr)))
+        n_hit = int(min(max_len, max(96, (dur_ms / 1000.0) * sr)))
         n_hit = int(min(n_hit, n_samples - t0))
-        if n_hit <= 8:
+        if n_hit <= 16:
             continue
 
-        # envelope
+        # pitch: estimate if tonal, else fallback to centroid mapping
+        f0 = 0.0
+        harm = 0.0
+        if pitch_enable:
+            # Use a slightly longer segment for f0 robustness
+            seg_f0_end = int(np.clip(seg_start + int(0.075 * sr), seg_start + 1, n_samples))
+            seg_f0 = y_src[seg_start:seg_f0_end]
+            f0_est, harm = estimate_f0_autocorr(seg_f0, sr=sr, fmin=pitch_fmin, fmax=pitch_fmax)
+            if harm >= tonality_thr and (pitch_fmin <= f0_est <= pitch_fmax):
+                f0 = float(f0_est)
+
+        if f0 <= 1.0:
+            # fallback mapping (works well for hats/snare-ish)
+            f0 = float(np.interp(cn, [0.0, 1.0], [55.0, 240.0]))
+
+        # pitch envelope (configurable)
+        f_inst = pitch_envelope_freq(
+            f0=f0,
+            sr=sr,
+            n=n_hit,
+            semi=pitch_env_semi,
+            env_ms=pitch_env_ms,
+            strength=pitch_env_strength,
+        )
+        # slight “pitch drop with velocity” (musical)
+        f_inst = (f_inst * (1.0 - 0.12 * vel)).astype(np.float32)
+
+        # amplitude envelope: incorporate band energy
         env = exp_env(n_hit, sr, attack_ms=attack_ms, dur_ms=dur_ms, curve=1.25)
-        # banda low/lowmid manda un poco más sustain si existe energía
         band_energy = float(np.clip(0.40 * env_bands[0][fr] + 0.35 * env_bands[1][fr] + 0.25 * env_bands[2][fr], 0.0, 1.0))
         env *= float(0.6 + 0.9 * band_energy)
 
-        osc, _ = render_wavetable_osc_fixed(table, f_hz=f0, sr=sr, n=n_hit, phase0=0.0)
+        osc, _ = render_wavetable_osc_varfreq(table, f_inst=f_inst, sr=sr, phase0=0.0)
         y_hit = (osc * env * vel).astype(np.float32)
 
-        # "click" + "air" (solo ataque, muy corto)
-        click_len = int(max(16, (min(10.0, attack_ms * 4.0) / 1000.0) * sr))
+        # click + air (ataque)
+        click_len = int(max(32, (min(10.0, attack_ms * 4.0) / 1000.0) * sr))
         click_len = min(click_len, n_hit)
-        if click_len > 8:
-            # click = derivada del env (o impulse corto) highpassed
+        if click_len > 16:
             d = np.diff(env[:click_len], prepend=0.0).astype(np.float32)
             click = one_pole_hpf(d, sr, DEFAULT_CLICK_HPF) * 2.2
             y_hit[:click_len] += click.astype(np.float32)
 
-            # air noise (ataque)
             noise = rng.standard_normal(click_len).astype(np.float32) * 0.25
             air = one_pole_hpf(noise, sr, DEFAULT_AIR_HPF)
             y_hit[:click_len] += air * float(0.35 + 0.65 * cn) * vel
@@ -594,16 +812,16 @@ def synth_layer_wt_hits(
         out[t0 : t0 + n_hit] += y_hit
 
         if log_cb and (k % 8 == 0):
+            fid0 = int(wt_index["file_ids"][idxs[0]])
+            p0 = os.path.basename(wt_index["paths"][fid0])
             log_cb(
                 f" Hit {k+1}/{len(triggers_frames)} @frame={fr} vel={vel:.2f} cn={cn:.2f} "
-                f"match={os.path.basename(wt_path)} frame={choose_idx}/{nfr-1} sim={sims[0]:.3f}"
+                f"f0={f0:.1f}Hz harm={harm:.2f} table≈{p0} mixN={mix_n} pos={pos_state:.2f} sim0={sims[0]:.3f}"
             )
 
-    # If only_hits=False, puedes opcionalmente mezclar un “bed” suave del original (no recomendado si quieres reconstrucción total)
     if not only_hits:
         out += 0.0 * y_src
 
-    # peak control
     mx = float(np.max(np.abs(out)) + 1e-12)
     out = (out / mx * 0.95).astype(np.float32)
     return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
@@ -613,7 +831,7 @@ def synth_layer_wt_hits(
 def spectral_envelope_match(
     y_syn: np.ndarray,
     sr: int,
-    spec_env_src: np.ndarray,  # (bins, frames)
+    spec_env_src: np.ndarray,
     frame_length: int,
     hop_length: int,
     spec_smooth_bins: int,
@@ -677,12 +895,14 @@ class AudioWorker(QObject):
         output_path: str,
         wt_dir: str,
         seed: int,
+        process_96k: bool,
         hop_length: int,
         frame_length: int,
         env_alpha: float,
         transient_alpha: float,
         only_hits: bool,
         output_gain: float,
+        normalize_to_original_peak: bool,
         enable_spec_match: bool,
         spec_strength: float,
         spec_smooth_bins: int,
@@ -697,18 +917,27 @@ class AudioWorker(QObject):
         attack_ms: float,
         # match params
         match_topk: int,
+        mix_n: int,
+        mix_temp: float,
         pos_min: float,
         pos_max: float,
-        mip_min: float,
-        mip_max: float,
         pos_walk_min: float,
         pos_walk_max: float,
+        # pitch params
+        pitch_enable: bool,
+        pitch_fmin: float,
+        pitch_fmax: float,
+        tonality_thr: float,
+        pitch_env_semi: float,
+        pitch_env_ms: float,
+        pitch_env_strength: float,
     ):
         super().__init__()
         self.input_path = input_path
         self.output_path = output_path
         self.wt_dir = wt_dir
         self.seed = int(seed)
+        self.process_96k = bool(process_96k)
 
         self.hop_length = int(hop_length)
         self.frame_length = int(frame_length)
@@ -716,6 +945,7 @@ class AudioWorker(QObject):
         self.transient_alpha = float(transient_alpha)
         self.only_hits = bool(only_hits)
         self.output_gain = float(output_gain)
+        self.normalize_to_original_peak = bool(normalize_to_original_peak)
 
         self.enable_spec_match = bool(enable_spec_match)
         self.spec_strength = float(spec_strength)
@@ -731,12 +961,20 @@ class AudioWorker(QObject):
         self.attack_ms = float(attack_ms)
 
         self.match_topk = int(match_topk)
+        self.mix_n = int(mix_n)
+        self.mix_temp = float(mix_temp)
         self.pos_min = float(pos_min)
         self.pos_max = float(pos_max)
-        self.mip_min = float(mip_min)
-        self.mip_max = float(mip_max)
         self.pos_walk_min = float(pos_walk_min)
         self.pos_walk_max = float(pos_walk_max)
+
+        self.pitch_enable = bool(pitch_enable)
+        self.pitch_fmin = float(pitch_fmin)
+        self.pitch_fmax = float(pitch_fmax)
+        self.tonality_thr = float(tonality_thr)
+        self.pitch_env_semi = float(pitch_env_semi)
+        self.pitch_env_ms = float(pitch_env_ms)
+        self.pitch_env_strength = float(pitch_env_strength)
 
         self._wt_index = None
 
@@ -757,10 +995,23 @@ class AudioWorker(QObject):
     def _process_one(self, src_file: str, out_file: str, rng: np.random.Generator):
         self._log(f"Fuente: {os.path.basename(src_file)}")
 
-        y, sr = load_mono(src_file)
-        self._log(f" len={len(y)} sr={sr}")
+        y0, sr0 = load_mono(src_file)
+        ref_peak = peak_amp(y0)
+        ref_db = peak_dbfs(y0)
+        self._log(f" sr_in={sr0} len={len(y0)} peak={ref_db:.2f} dBFS")
 
-        # Analysis: env + specenv + mag/logmag
+        # Resample to 96k if enabled
+        if self.process_96k and sr0 != TARGET_SR:
+            self._log(f" Resample → {TARGET_SR} Hz (alta calidad resample_poly)...")
+            y = resample_to_target(y0, sr_in=sr0, sr_target=TARGET_SR)
+            sr = TARGET_SR
+        else:
+            y = y0
+            sr = sr0
+
+        self._log(f" sr_proc={sr} len_proc={len(y)}")
+
+        # Analysis: env/spec + flux/triggers + centroid
         self._log(" Analizando: multiband env + spec_env + flux/triggers...")
         env_bands, spec_env, mag, logmag = extract_multiband_env_and_specenv(
             y=y,
@@ -777,15 +1028,14 @@ class AudioWorker(QObject):
 
         min_dist_frames = int(max(1, (self.min_dist_ms / 1000.0) * sr / self.hop_length))
         triggers = pick_triggers(flux, thresh=self.thresh, min_dist_frames=min_dist_frames)
-
-        self._log(f" Triggers detectados: {len(triggers)} (thresh={self.thresh:.2f}, min_dist={self.min_dist_ms:.1f}ms)")
+        self._log(f" Triggers: {len(triggers)} (thresh={self.thresh:.2f}, min_dist={self.min_dist_ms:.1f}ms)")
 
         if len(triggers) == 0:
             raise RuntimeError("No se detectaron hits. Baja thresh o reduce min_dist.")
 
-        # Synthesis (wavetable match)
-        self._log(" Sintetizando: wavetable-match por hit + click + air (timing intacto)...")
-        y_syn = synth_layer_wt_hits(
+        # Synthesis: pitch-per-hit + multi-candidate blend
+        self._log(" Sintetizando: WT-match por hit + pitch-per-hit (auto) + multi-candidato...")
+        y_syn = synth_wt_hits_recon(
             y_src=y,
             sr=sr,
             triggers_frames=triggers,
@@ -796,17 +1046,24 @@ class AudioWorker(QObject):
             frame_length=self.frame_length,
             wt_index=self._wt_index,
             match_topk=self.match_topk,
-            min_pos_walk=self.pos_walk_min,
-            max_pos_walk=self.pos_walk_max,
-            mip_min=self.mip_min,
-            mip_max=self.mip_max,
+            mix_n=self.mix_n,
+            mix_temp=self.mix_temp,
             pos_min=self.pos_min,
             pos_max=self.pos_max,
+            pos_walk_min=self.pos_walk_min,
+            pos_walk_max=self.pos_walk_max,
             body_start_ms=self.body_start_ms,
             body_dur_ms=self.body_dur_ms,
             max_hit_ms=self.max_hit_ms,
             attack_ms=self.attack_ms,
             only_hits=self.only_hits,
+            pitch_enable=self.pitch_enable,
+            pitch_fmin=self.pitch_fmin,
+            pitch_fmax=self.pitch_fmax,
+            tonality_thr=self.tonality_thr,
+            pitch_env_semi=self.pitch_env_semi,
+            pitch_env_ms=self.pitch_env_ms,
+            pitch_env_strength=self.pitch_env_strength,
             rng=rng,
             log_cb=self._log,
         ).astype(np.float32)
@@ -826,14 +1083,24 @@ class AudioWorker(QObject):
                 clamp_hi=self.spec_clamp_hi,
             )
 
+        # Output gain
         if self.output_gain != 1.0:
             y_syn = np.clip(y_syn * float(self.output_gain), -1.0, 1.0).astype(np.float32)
 
+        # Normalize to original peak (same peak dBFS as source)
+        if self.normalize_to_original_peak:
+            self._log(f" Normalizando al pico original (ref_peak={ref_db:.2f} dBFS)...")
+            y_syn = match_peak_to_reference(y_syn, ref_peak_amp=ref_peak)
+
+        # Ensure output dir
         out_dir = os.path.dirname(out_file)
         if out_dir and not os.path.isdir(out_dir):
             os.makedirs(out_dir, exist_ok=True)
-        sf.write(out_file, y_syn, sr)
-        self._log(f" Guardado: {out_file}")
+
+        # Write 24-bit WAV
+        # (Si el path no termina en .wav, lo dejamos igual, pero PCM_24 aplica idealmente a WAV/AIFF)
+        sf.write(out_file, y_syn, sr, subtype=OUTPUT_SUBTYPE)
+        self._log(f" Guardado: {out_file} (sr={sr}, {OUTPUT_SUBTYPE})")
 
     def run(self):
         try:
@@ -866,8 +1133,8 @@ class AudioWorker(QObject):
                         out_file = outp
 
                 self.progress.emit(5)
-                self._log("=== PROCESO SINGLE (WT MATCH RECON) ===")
-                self._log(f"Seed={'RANDOM' if self.seed==0 else self.seed}")
+                self._log("=== PROCESO SINGLE (WT MATCH RECON PRO) ===")
+                self._log(f"Seed={'RANDOM' if self.seed==0 else self.seed} | 96k={'ON' if self.process_96k else 'OFF'}")
                 self._process_one(inp, out_file, rng)
                 self.progress.emit(100)
                 self.finished.emit()
@@ -886,10 +1153,10 @@ class AudioWorker(QObject):
             if not files:
                 raise RuntimeError("No se encontraron audios en la carpeta input.")
 
-            self._log("=== PROCESO BATCH (WT MATCH RECON) ===")
+            self._log("=== PROCESO BATCH (WT MATCH RECON PRO) ===")
             self._log(f"Input: {in_dir}")
             self._log(f"Output: {out_dir}")
-            self._log(f"Seed={'RANDOM' if self.seed==0 else self.seed}")
+            self._log(f"Seed={'RANDOM' if self.seed==0 else self.seed} | 96k={'ON' if self.process_96k else 'OFF'}")
             self._log(f"Archivos: {len(files)}")
 
             self.progress.emit(1)
@@ -912,8 +1179,8 @@ class AudioWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WT Match Reconstructor (Serum/Vital-style) — Batch/Single + qdarkstyle")
-        self.resize(1040, 760)
+        self.setWindowTitle("WT Match Reconstructor PRO (Pitch-per-hit + Multi-candidate + 96k/24bit)")
+        self.resize(1100, 820)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -951,12 +1218,13 @@ class MainWindow(QMainWindow):
         layout.addLayout(row_out)
 
         # Wavetables
-        gb_wt = QGroupBox("Wavetables (Serum/Vital exports) + Index")
+        gb_wt = QGroupBox("Wavetables + Index")
         g = QVBoxLayout(gb_wt)
 
         self.wt_dir_edit = QLineEdit(WT_DIR_DEFAULT)
         btn_wt_dir = QPushButton("Carpeta…")
         btn_wt_dir.clicked.connect(self.pick_wt_dir)
+
         row_wtdir = QHBoxLayout()
         row_wtdir.addWidget(QLabel("Carpeta wavetables:"))
         row_wtdir.addWidget(self.wt_dir_edit, stretch=1)
@@ -967,15 +1235,20 @@ class MainWindow(QMainWindow):
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 2_000_000_000)
         self.seed_spin.setValue(0)
-        row_seed.addWidget(QLabel("Seed (0 = RANDOM):"))
+        self.process_96k = QCheckBox("Procesar a 96k")
+        self.process_96k.setChecked(True)
+
+        row_seed.addWidget(QLabel("Seed (0=RANDOM):"))
         row_seed.addWidget(self.seed_spin)
+        row_seed.addSpacing(10)
+        row_seed.addWidget(self.process_96k)
         row_seed.addStretch()
         g.addLayout(row_seed)
 
         layout.addWidget(gb_wt)
 
-        # Analysis / Hit controls
-        gb_an = QGroupBox("Análisis de hits (timing intacto)")
+        # Hit controls
+        gb_an = QGroupBox("Hits / Timing")
         a = QHBoxLayout(gb_an)
 
         self.hop_spin = QSpinBox()
@@ -993,7 +1266,7 @@ class MainWindow(QMainWindow):
         self.trans_alpha.setSingleStep(0.05)
         self.trans_alpha.setValue(0.25)
 
-        self.only_hits_check = QCheckBox("Solo hits (sin bed)")
+        self.only_hits_check = QCheckBox("Solo hits")
         self.only_hits_check.setChecked(True)
 
         self.thresh_spin = QDoubleSpinBox()
@@ -1012,7 +1285,7 @@ class MainWindow(QMainWindow):
         self.body_start_spin.setValue(DEFAULT_BODY_START_MS)
 
         self.body_dur_spin = QDoubleSpinBox()
-        self.body_dur_spin.setRange(8.0, 120.0)
+        self.body_dur_spin.setRange(8.0, 140.0)
         self.body_dur_spin.setSingleStep(2.0)
         self.body_dur_spin.setValue(DEFAULT_BODY_DUR_MS)
 
@@ -1056,13 +1329,22 @@ class MainWindow(QMainWindow):
         a.addStretch()
         layout.addWidget(gb_an)
 
-        # Match / WT behavior
-        gb_mt = QGroupBox("Matching (carácter de wavetable)")
+        # Matching / Multi-candidate
+        gb_mt = QGroupBox("Matching (Multi-candidato + carácter)")
         m = QHBoxLayout(gb_mt)
 
         self.match_topk = QSpinBox()
-        self.match_topk.setRange(1, 32)
-        self.match_topk.setValue(8)
+        self.match_topk.setRange(1, 64)
+        self.match_topk.setValue(12)
+
+        self.mix_n = QSpinBox()
+        self.mix_n.setRange(1, 6)
+        self.mix_n.setValue(DEFAULT_MIX_N)
+
+        self.mix_temp = QDoubleSpinBox()
+        self.mix_temp.setRange(0.01, 1.0)
+        self.mix_temp.setSingleStep(0.01)
+        self.mix_temp.setValue(DEFAULT_MIX_TEMP)
 
         self.pos_min = QDoubleSpinBox()
         self.pos_min.setRange(0.0, 1.0)
@@ -1084,19 +1366,15 @@ class MainWindow(QMainWindow):
         self.pos_walk_max.setSingleStep(0.005)
         self.pos_walk_max.setValue(0.03)
 
-        # placeholders (future: mipmaps / antialias). Here kept for UI compatibility.
-        self.mip_min = QDoubleSpinBox()
-        self.mip_min.setRange(0.0, 1.0)
-        self.mip_min.setSingleStep(0.05)
-        self.mip_min.setValue(0.6)
-        self.mip_max = QDoubleSpinBox()
-        self.mip_max.setRange(0.0, 1.0)
-        self.mip_max.setSingleStep(0.05)
-        self.mip_max.setValue(1.0)
-
         m.addWidget(QLabel("TopK:"))
         m.addWidget(self.match_topk)
         m.addSpacing(10)
+        m.addWidget(QLabel("MixN:"))
+        m.addWidget(self.mix_n)
+        m.addSpacing(10)
+        m.addWidget(QLabel("Temp:"))
+        m.addWidget(self.mix_temp)
+        m.addSpacing(14)
         m.addWidget(QLabel("Pos min:"))
         m.addWidget(self.pos_min)
         m.addWidget(QLabel("max:"))
@@ -1106,13 +1384,64 @@ class MainWindow(QMainWindow):
         m.addWidget(self.pos_walk_min)
         m.addWidget(QLabel("max:"))
         m.addWidget(self.pos_walk_max)
-        m.addSpacing(10)
-        m.addWidget(QLabel("Mip min:"))
-        m.addWidget(self.mip_min)
-        m.addWidget(QLabel("max:"))
-        m.addWidget(self.mip_max)
         m.addStretch()
         layout.addWidget(gb_mt)
+
+        # Pitch per hit
+        gb_pitch = QGroupBox("Pitch por hit (auto) + Pitch envelope")
+        p = QHBoxLayout(gb_pitch)
+
+        self.pitch_enable = QCheckBox("Pitch auto")
+        self.pitch_enable.setChecked(DEFAULT_PITCH_ENABLE)
+
+        self.pitch_fmin = QDoubleSpinBox()
+        self.pitch_fmin.setRange(20.0, 2000.0)
+        self.pitch_fmin.setSingleStep(5.0)
+        self.pitch_fmin.setValue(DEFAULT_PITCH_FMIN)
+
+        self.pitch_fmax = QDoubleSpinBox()
+        self.pitch_fmax.setRange(60.0, 8000.0)
+        self.pitch_fmax.setSingleStep(10.0)
+        self.pitch_fmax.setValue(DEFAULT_PITCH_FMAX)
+
+        self.tonality_thr = QDoubleSpinBox()
+        self.tonality_thr.setRange(0.05, 0.95)
+        self.tonality_thr.setSingleStep(0.05)
+        self.tonality_thr.setValue(DEFAULT_TONALITY_THR)
+
+        self.pitch_env_semi = QDoubleSpinBox()
+        self.pitch_env_semi.setRange(-24.0, 24.0)
+        self.pitch_env_semi.setSingleStep(1.0)
+        self.pitch_env_semi.setValue(DEFAULT_PITCH_ENV_SEMI)
+
+        self.pitch_env_ms = QDoubleSpinBox()
+        self.pitch_env_ms.setRange(0.0, 80.0)
+        self.pitch_env_ms.setSingleStep(1.0)
+        self.pitch_env_ms.setValue(DEFAULT_PITCH_ENV_MS)
+
+        self.pitch_env_strength = QDoubleSpinBox()
+        self.pitch_env_strength.setRange(0.0, 1.0)
+        self.pitch_env_strength.setSingleStep(0.05)
+        self.pitch_env_strength.setValue(DEFAULT_PITCH_ENV_STRENGTH)
+
+        p.addWidget(self.pitch_enable)
+        p.addSpacing(10)
+        p.addWidget(QLabel("Fmin:"))
+        p.addWidget(self.pitch_fmin)
+        p.addWidget(QLabel("Fmax:"))
+        p.addWidget(self.pitch_fmax)
+        p.addSpacing(10)
+        p.addWidget(QLabel("Tonal thr:"))
+        p.addWidget(self.tonality_thr)
+        p.addSpacing(14)
+        p.addWidget(QLabel("Env semi:"))
+        p.addWidget(self.pitch_env_semi)
+        p.addWidget(QLabel("ms:"))
+        p.addWidget(self.pitch_env_ms)
+        p.addWidget(QLabel("strength:"))
+        p.addWidget(self.pitch_env_strength)
+        p.addStretch()
+        layout.addWidget(gb_pitch)
 
         # Output
         gb_out = QGroupBox("Salida")
@@ -1122,13 +1451,19 @@ class MainWindow(QMainWindow):
         self.gain_spin.setRange(0.1, 3.0)
         self.gain_spin.setSingleStep(0.1)
         self.gain_spin.setValue(1.0)
+
+        self.norm_peak = QCheckBox("Normalizar al pico original")
+        self.norm_peak.setChecked(True)
+
         o.addWidget(QLabel("Gain:"))
         o.addWidget(self.gain_spin)
+        o.addSpacing(10)
+        o.addWidget(self.norm_peak)
         o.addStretch()
         layout.addWidget(gb_out)
 
         # Spectral glue
-        gb_sm = QGroupBox("Spectral glue (pegar timbre del original) — opcional")
+        gb_sm = QGroupBox("Spectral glue (opcional)")
         s = QHBoxLayout(gb_sm)
 
         self.spec_enable = QCheckBox("Activar")
@@ -1183,7 +1518,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.logs, stretch=1)
 
         layout.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Expanding))
-        footer = QLabel("© 2025 — WT Match Reconstructor")
+        footer = QLabel("© 2025 — WT Match Reconstructor PRO")
         footer.setAlignment(Qt.AlignCenter)
         layout.addWidget(footer)
 
@@ -1243,16 +1578,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Wavetables", "La carpeta de wavetables no existe.")
             return
 
-        # pos min/max sanity
         pos_min = float(self.pos_min.value())
         pos_max = float(self.pos_max.value())
         if pos_min > pos_max:
             pos_min, pos_max = pos_max, pos_min
-
-        mip_min = float(self.mip_min.value())
-        mip_max = float(self.mip_max.value())
-        if mip_min > mip_max:
-            mip_min, mip_max = mip_max, mip_min
 
         self.logs.clear()
         self.progress.setValue(0)
@@ -1264,12 +1593,14 @@ class MainWindow(QMainWindow):
             output_path=outp,
             wt_dir=wt_dir,
             seed=int(self.seed_spin.value()),
+            process_96k=bool(self.process_96k.isChecked()),
             hop_length=int(self.hop_spin.value()),
             frame_length=DEFAULT_FRAME_LENGTH,
             env_alpha=float(self.env_alpha.value()),
             transient_alpha=float(self.trans_alpha.value()),
             only_hits=bool(self.only_hits_check.isChecked()),
             output_gain=float(self.gain_spin.value()),
+            normalize_to_original_peak=bool(self.norm_peak.isChecked()),
             enable_spec_match=bool(self.spec_enable.isChecked()),
             spec_strength=float(self.spec_strength.value()),
             spec_smooth_bins=int(self.spec_smooth_bins.value()),
@@ -1282,12 +1613,19 @@ class MainWindow(QMainWindow):
             max_hit_ms=float(self.maxhit_spin.value()),
             attack_ms=float(self.attack_spin.value()),
             match_topk=int(self.match_topk.value()),
+            mix_n=int(self.mix_n.value()),
+            mix_temp=float(self.mix_temp.value()),
             pos_min=pos_min,
             pos_max=pos_max,
-            mip_min=mip_min,
-            mip_max=mip_max,
             pos_walk_min=float(self.pos_walk_min.value()),
             pos_walk_max=float(self.pos_walk_max.value()),
+            pitch_enable=bool(self.pitch_enable.isChecked()),
+            pitch_fmin=float(self.pitch_fmin.value()),
+            pitch_fmax=float(self.pitch_fmax.value()),
+            tonality_thr=float(self.tonality_thr.value()),
+            pitch_env_semi=float(self.pitch_env_semi.value()),
+            pitch_env_ms=float(self.pitch_env_ms.value()),
+            pitch_env_strength=float(self.pitch_env_strength.value()),
         )
 
         self.worker.moveToThread(self.thread)
@@ -1325,4 +1663,5 @@ if __name__ == "__main__":
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
+
 
